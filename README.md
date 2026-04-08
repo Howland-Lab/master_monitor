@@ -94,13 +94,13 @@ A typical setup looks like this:
 
 ```text
 repo/
-├── master_monitor_body.sh
+├── master_monitor.sh
 ├── README.md
 └── examples/
     └── local_case_job.sh
 ```
 
-### `master_monitor_body.sh`
+### `master_monitor.sh`
 
 The shared monitoring and auto-resubmission logic.
 
@@ -200,7 +200,7 @@ A case-specific Slurm script may look like this:
 MAIN_INPUTFILE="/path/to/input_main.dat"
 SOLVER="/path/to/solver_binary"
 SOURCEDFILE="/path/to/setup_environment.sh"
-MASTER_MONITOR_SCRIPT="/path/to/master_monitor_body.sh"
+MASTER_MONITOR_SCRIPT="/path/to/master_monitor.sh"
 
 SAFETY_FACTOR=1.5
 MONITOR_INTERVAL=60
