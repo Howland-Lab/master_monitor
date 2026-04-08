@@ -426,12 +426,6 @@ Users working with different restart conventions may need to adapt helper functi
 
 ---
 
-## License
-
-MIT License is a good default choice for broad academic and public reuse, unless your institution or lab requires a different open-source license.
-
----
-
 ## Contact
 
 For questions, issues, or maintenance inquiries:
