@@ -102,7 +102,26 @@ run_job() {
 #  The remainder of the script typically does not need to be modified.
 # ==============================================================================
 
-JOB_CONFIG_ABS="$(realpath "${BASH_SOURCE[0]}")"
+JOB_CONFIG_CMD="$(scontrol show job -o "${SLURM_JOB_ID}" | tr ' ' '\n' | awk -F= '$1=="Command"{print $2; exit}')"
+
+if [[ -z "${JOB_CONFIG_CMD}" ]]; then
+    echo "[ERROR] Could not determine config file path from scontrol for job ${SLURM_JOB_ID}" >&2
+    exit 1
+fi
+
+if [[ "${JOB_CONFIG_CMD}" = /* ]]; then
+    JOB_CONFIG_ABS="${JOB_CONFIG_CMD}"
+else
+    JOB_CONFIG_ABS="${SLURM_SUBMIT_DIR}/${JOB_CONFIG_CMD}"
+fi
+
+JOB_CONFIG_ABS="$(realpath "${JOB_CONFIG_ABS}")"
+
+if [[ -z "${JOB_CONFIG_ABS}" || ! -f "${JOB_CONFIG_ABS}" ]]; then
+    echo "[ERROR] Resolved config file does not exist: ${JOB_CONFIG_ABS}" >&2
+    exit 1
+fi
+
 JOB_CONFIG_DIR="$(dirname "${JOB_CONFIG_ABS}")"
 JOB_CONFIG_BASE="$(basename "${JOB_CONFIG_ABS}")"
 
