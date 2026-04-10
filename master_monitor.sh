@@ -84,34 +84,40 @@
 #    SOLVER
 #    SOURCEDFILE
 #    run_job()
-#    JOB_CONFIG_ABS / JOB_CONFIG_DIR / JOB_CONFIG_BASE
-#
-#  Typical usage pattern
-#  ---------------------
-#  A case-specific job script ends with:
-#
-#      JOB_CONFIG_ABS="$(realpath "${BASH_SOURCE[0]}")"
-#      JOB_CONFIG_DIR="$(dirname "${JOB_CONFIG_ABS}")"
-#      JOB_CONFIG_BASE="$(basename "${JOB_CONFIG_ABS}")"
-#      source "/path/to/master_monitor_body.sh"
-#
-#  and is submitted directly with:
-#
-#      sbatch local_case_job.sh
 #
 #  In that arrangement, all auto-resubmitted child jobs also submit the same
 #  local_case_job.sh file, while this master script provides the shared logic.
 # ==============================================================================
+
+# Resolve the local job script path
+JOB_CONFIG_CMD="$(scontrol show job -o "${SLURM_JOB_ID}" | tr ' ' '\n' | awk -F= '$1=="Command"{print $2; exit}')"
+
+if [[ -z "${JOB_CONFIG_CMD}" ]]; then
+    echo "[ERROR] Could not determine config file path from scontrol for job ${SLURM_JOB_ID}" >&2
+    exit 1
+fi
+
+if [[ "${JOB_CONFIG_CMD}" = /* ]]; then
+    CONFIG_ABS="${JOB_CONFIG_CMD}"
+else
+    CONFIG_ABS="${SLURM_SUBMIT_DIR}/${JOB_CONFIG_CMD}"
+fi
+
+CONFIG_ABS="$(realpath "${CONFIG_ABS}")"
+
+if [[ -z "${CONFIG_ABS}" || ! -f "${CONFIG_ABS}" ]]; then
+    echo "[ERROR] Resolved config file does not exist: ${CONFIG_ABS}" >&2
+    exit 1
+fi
+
+CONFIG_DIR="$(dirname "${CONFIG_ABS}")"
+CONFIG_BASE="$(basename "${CONFIG_ABS}")"
 
 [[ -f "${SOURCEDFILE}" ]] || { echo "[ERROR] Setup file not found: ${SOURCEDFILE}" >&2; exit 1; }
 source "${SOURCEDFILE}"
 
 export inputFile="${MAIN_INPUTFILE}"
 export solver="${SOLVER}"
-
-CONFIG_ABS="${JOB_CONFIG_ABS}"
-CONFIG_DIR="${JOB_CONFIG_DIR}"
-CONFIG_BASE="${JOB_CONFIG_BASE}"
 
 THIS_SCRIPT="${CONFIG_ABS}"
 RESTART_LOCKFILE="${CONFIG_DIR}/.${CONFIG_BASE}.restart_lock"

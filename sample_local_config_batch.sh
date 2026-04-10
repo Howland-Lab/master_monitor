@@ -1,10 +1,4 @@
 #!/bin/bash
-
-# ==============================================================================
-#  USER CONFIGURATION
-#  Adjust these variables each time you start a fresh simulation chain.
-# ==============================================================================
-
 #SBATCH --nodes=56
 #SBATCH --partition=compute
 #SBATCH --ntasks-per-node=64
@@ -28,10 +22,6 @@ SOURCEDFILE="/path/to/setup_environment.sh"
 
 # Path to the shared master monitor script
 MASTER_MONITOR_SCRIPT="/path/to/master_monitor.sh"
-
-# ------------------------------------------------------------------------------
-#  MONITORING / RESTART POLICY SETTINGS
-# ------------------------------------------------------------------------------
 
 # Polling interval for the main monitor loop (seconds).
 # This controls:
@@ -59,10 +49,6 @@ ESTIMATE_PERSISTENCE_SAMPLES=10
 # Number of recent logged elapsed-step values to average when estimating
 # wall-seconds per step from the solver output log.
 ELAPSED_STEP_WINDOW=5
-
-# ==============================================================================
-#  MEMORY GUARD SETTINGS
-# ==============================================================================
 
 # Enable proactive memory-based restart logic.
 # 1 = enabled, 0 = disabled
@@ -92,10 +78,6 @@ MEMORY_GUARD_PERSISTENCE_SAMPLES=3
 # Number of recent memory samples used to estimate memory growth rate.
 MEMORY_RATE_WINDOW=4
 
-# ==============================================================================
-#  PLATFORM-SPECIFIC LAUNCHER
-# ==============================================================================
-
 # Define how the solver is launched on the local system.
 # Examples:
 #   mpirun -np "${SLURM_NTASKS}"           # common on many Slurm clusters
@@ -108,36 +90,5 @@ run_job() {
     MPI_PID=$!
 }
 
-# ==============================================================================
-#  END OF USER CONFIGURATION
-#  The remainder of the script typically does not need to be modified.
-# ==============================================================================
-
-JOB_CONFIG_CMD="$(scontrol show job -o "${SLURM_JOB_ID}" | tr ' ' '\n' | awk -F= '$1=="Command"{print $2; exit}')"
-
-if [[ -z "${JOB_CONFIG_CMD}" ]]; then
-    echo "[ERROR] Could not determine config file path from scontrol for job ${SLURM_JOB_ID}" >&2
-    exit 1
-fi
-
-if [[ "${JOB_CONFIG_CMD}" = /* ]]; then
-    JOB_CONFIG_ABS="${JOB_CONFIG_CMD}"
-else
-    JOB_CONFIG_ABS="${SLURM_SUBMIT_DIR}/${JOB_CONFIG_CMD}"
-fi
-
-JOB_CONFIG_ABS="$(realpath "${JOB_CONFIG_ABS}")"
-
-if [[ -z "${JOB_CONFIG_ABS}" || ! -f "${JOB_CONFIG_ABS}" ]]; then
-    echo "[ERROR] Resolved config file does not exist: ${JOB_CONFIG_ABS}" >&2
-    exit 1
-fi
-
-JOB_CONFIG_DIR="$(dirname "${JOB_CONFIG_ABS}")"
-JOB_CONFIG_BASE="$(basename "${JOB_CONFIG_ABS}")"
-
-# ==============================================================================
-#  START MASTER MONITOR
-# ==============================================================================
-
+# Start the master monitoring script
 source "${MASTER_MONITOR_SCRIPT}"

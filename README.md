@@ -121,7 +121,6 @@ The local job script sets:
 * the platform-specific `run_job()` function,
 * paths to the input file, solver, environment setup file, and master monitor body.
 
-At the end of the local script, it resolves its own path and sources the master monitor body.
 
 ### 2. Master body starts the simulation
 
