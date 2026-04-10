@@ -50,6 +50,10 @@ ESTIMATE_PERSISTENCE_SAMPLES=10
 # wall-seconds per step from the solver output log.
 ELAPSED_STEP_WINDOW=5
 
+# Initial sleep time before the first monitor cycle, to allow the job to start up.
+# Default is 5 minutes (300 seconds)
+MONITOR_SETTLE_TIME=600  
+
 # Enable proactive memory-based restart logic.
 # 1 = enabled, 0 = disabled
 MEMORY_GUARD_ENABLED=1

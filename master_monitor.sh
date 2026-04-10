@@ -48,10 +48,12 @@
 #
 #  Logging
 #  -------
-#  All non-CSV messages are written to stdout, which Slurm captures in the
-#  job output log defined by the #SBATCH -o directive. There is no separate
-#  monitor log file. Memory samples are written to a per-job CSV file:
+#  Monitor messages are written to a separate log file:
+#      monitor.log.${SLURM_JOB_ID}
+#  Memory samples are written to a per-job CSV file:
 #      memdiag_job${SLURM_JOB_ID}.csv
+#  The simulation's own output goes to the log file defined by the #SBATCH -o
+#  directive in the local job script.
 #
 #  Memory sampling
 #  ---------------
@@ -125,11 +127,17 @@ RESTART_LOCKFILE="${CONFIG_DIR}/.${CONFIG_BASE}.restart_lock"
 # CSV file for per-cycle memory samples
 MEM_CSV="${CONFIG_DIR}/memdiag_job${SLURM_JOB_ID}.csv"
 
+# Monitoring log file
+MONITOR_LOG="${CONFIG_DIR}/monitor.log.${SLURM_JOB_ID}"
+
 HARD_CUTOFF_SECONDS="${HARD_CUTOFF_SECONDS:-600}"
 SAFETY_FACTOR="${SAFETY_FACTOR:-1.2}"
 MONITOR_INTERVAL="${MONITOR_INTERVAL:-60}"
 FROZEN_TIMEOUT_SECONDS="${FROZEN_TIMEOUT_SECONDS:-7200}"
 ESTIMATE_PERSISTENCE_SAMPLES="${ESTIMATE_PERSISTENCE_SAMPLES:-10}"
+
+# Initial sleep time before the first monitor cycle, to allow the job to start up and produce some output.
+MONITOR_SETTLE_TIME="${MONITOR_SETTLE_TIME:-300}"  # Default 5 minutes (300 seconds)
 
 # Memory-guard settings (node-based)
 MEMORY_GUARD_ENABLED="${MEMORY_GUARD_ENABLED:-1}"
@@ -192,9 +200,9 @@ fi
 #  HELPERS
 # ==============================================================================
 
-# mlog: print a timestamped message to stdout (captured by Slurm into OUTPUT_LOG)
+# mlog: print a timestamped message to monitor log file
 mlog() {
-    printf '[%s] %s\n' "$(date '+%F %T')" "$*"
+    printf '[%s] %s\n' "$(date '+%F %T')" "$*" >> "${MONITOR_LOG}"
 }
 
 gb_to_kb() {
@@ -678,6 +686,7 @@ validate_integer "${ELAPSED_STEP_WINDOW}" "ELAPSED_STEP_WINDOW"
 [[ "${MEMORY_GUARD_PERSISTENCE_SAMPLES}" -gt 0 ]]   || { mlog "[ERROR] MEMORY_GUARD_PERSISTENCE_SAMPLES must be > 0"; exit 1; }
 [[ "${MEMORY_RATE_WINDOW}" -ge 2 ]]                 || { mlog "[ERROR] MEMORY_RATE_WINDOW must be >= 2"; exit 1; }
 [[ "${ELAPSED_STEP_WINDOW}" -ge 1 ]]                || { mlog "[ERROR] ELAPSED_STEP_WINDOW must be >= 1"; exit 1; }
+[[ "${MONITOR_SETTLE_TIME}" =~ ^[0-9]+$ ]]          || { mlog "[ERROR] MONITOR_SETTLE_TIME must be an integer"; exit 1; }
 
 WALL_TIME_SECONDS=$(parse_slurm_time_to_seconds "${WALL_TIME_STR}") || {
     echo "[ERROR] Failed to parse wall-time string: ${WALL_TIME_STR}" >&2
@@ -783,6 +792,8 @@ mlog "Mem slurm req/node  : ${SLURM_REQMEM_NODE_KB:-0} KB"
 mlog "Mem limit/node      : ${MEMORY_GUARD_NODE_LIMIT_RESOLVED_KB} KB"
 mlog "Mem trigger/node    : ${MEMORY_GUARD_TRIGGER_KB} KB"
 mlog "Mem CSV             : ${MEM_CSV}"
+mlog "Monitor log         : ${MONITOR_LOG}"
+mlog "Monitor settle time : ${MONITOR_SETTLE_TIME}s"
 mlog "Script path     : ${THIS_SCRIPT}"
 mlog "Primary input   : ${PRIMARY_INPUTFILE}"
 mlog "Precursor input : ${PRECURSOR_INPUTFILE}"
@@ -918,6 +929,16 @@ JOB_START_EPOCH=$(date +%s)
 mlog "MPI PID         : ${MPI_PID}"
 mlog "Clock started."
 mlog "Memory CSV      : ${MEM_CSV}"
+mlog "Monitor log     : ${MONITOR_LOG}"
+
+# Initial settling period
+if [[ "${MONITOR_SETTLE_TIME}" -gt 0 ]]; then
+    mlog "================================================================"
+    mlog "Waiting ${MONITOR_SETTLE_TIME}s for simulation to settle before monitoring starts..."
+    mlog "================================================================"
+    sleep "${MONITOR_SETTLE_TIME}"
+    mlog "Settling period complete. Starting active monitoring."
+fi
 
 # ==============================================================================
 #  MONITOR LOOP
@@ -966,14 +987,19 @@ while kill -0 "${MPI_PID}" 2>/dev/null; do
     if sample_memory_sstat; then
         CURRENT_MAXRSS_KB="${SSTAT_MAXRSS_KB}"
 
-        mlog "[Monitor][Mem] sstat maxrss=${CURRENT_MAXRSS_KB} KB | averss=${SSTAT_AVERSS_KB} KB | maxvm=${SSTAT_MAXVM_KB} KB"
+        # Calculate utilization percentage
+        MEM_UTIL_PCT=0
+        if [[ "${MEMORY_GUARD_ENABLED}" -eq 1 && "${MEMORY_GUARD_TRIGGER_KB}" -gt 0 ]]; then
+            MEM_UTIL_PCT=$(awk -v rss="${CURRENT_MAXRSS_KB}" -v lim="${MEMORY_GUARD_TRIGGER_KB}" \
+                'BEGIN { printf "%.0f", (rss / lim) * 100 }')
+        fi
 
         if [[ "${MEMORY_GUARD_ENABLED}" -eq 1 && "${MEMORY_GUARD_TRIGGER_KB}" -gt 0 ]]; then
 
             # Hard backstop: current RSS already at/above trigger
             if [[ "${CURRENT_MAXRSS_KB}" -ge "${MEMORY_GUARD_TRIGGER_KB}" ]]; then
                 MEMORY_BAD_SAMPLES=$(( MEMORY_BAD_SAMPLES + 1 ))
-                mlog "[Monitor][Mem] maxrss=${CURRENT_MAXRSS_KB} KB >= trigger=${MEMORY_GUARD_TRIGGER_KB} KB | bad=${MEMORY_BAD_SAMPLES}/${MEMORY_GUARD_PERSISTENCE_SAMPLES}"
+                mlog "[Monitor][Mem] rss=${CURRENT_MAXRSS_KB}KB (${MEM_UTIL_PCT}%) | lim=${MEMORY_GUARD_TRIGGER_KB}KB | STATUS: AT_LIMIT bad=${MEMORY_BAD_SAMPLES}/${MEMORY_GUARD_PERSISTENCE_SAMPLES}"
                 if [[ "${MEMORY_BAD_SAMPLES}" -ge "${MEMORY_GUARD_PERSISTENCE_SAMPLES}" ]]; then
                     TRIGGER_REASON="MEMORY GUARD (MaxRSS ${CURRENT_MAXRSS_KB} KB >= trigger ${MEMORY_GUARD_TRIGGER_KB} KB for ${MEMORY_BAD_SAMPLES} consecutive samples)"
                 fi
@@ -985,14 +1011,11 @@ while kill -0 "${MPI_PID}" 2>/dev/null; do
 
                 if [[ -n "${MEM_RATE_KBPS}" ]]; then
                     if [[ "$(echo "${MEM_RATE_KBPS} <= 0" | bc 2>/dev/null)" -eq 1 ]]; then
-                        [[ "${MEMORY_BAD_SAMPLES}" -gt 0 ]] && \
-                            mlog "[Monitor][Mem] Memory projection recovered. Resetting counter."
-                        MEMORY_BAD_SAMPLES=0
-                        mlog "[Monitor][Mem] maxrss=${CURRENT_MAXRSS_KB} KB | rate=${MEM_RATE_KBPS} KB/s | flat/decreasing"
+                        [[ "${MEMORY_BAD_SAMPLES}" -gt 0 ]] && MEMORY_BAD_SAMPLES=0
+                        mlog "[Monitor][Mem] rss=${CURRENT_MAXRSS_KB}KB (${MEM_UTIL_PCT}%) | lim=${MEMORY_GUARD_TRIGGER_KB}KB | rate=${MEM_RATE_KBPS}KB/s | STATUS: DECREASING"
                     else
                         MEM_HEADROOM_KB=$(( MEMORY_GUARD_TRIGGER_KB - CURRENT_MAXRSS_KB ))
-                        MEM_TIME_TO_LIMIT=$(echo "scale=2; ${MEM_HEADROOM_KB} / ${MEM_RATE_KBPS}" | bc 2>/dev/null)
-                        mlog "[Monitor][Mem] maxrss=${CURRENT_MAXRSS_KB} KB | trigger=${MEMORY_GUARD_TRIGGER_KB} KB | rate=${MEM_RATE_KBPS} KB/s | ttl=${MEM_TIME_TO_LIMIT}s | lookahead=${MEM_LOOKAHEAD_SECONDS}s"
+                        MEM_TIME_TO_LIMIT=$(echo "scale=0; ${MEM_HEADROOM_KB} / ${MEM_RATE_KBPS}" | bc 2>/dev/null)
 
                         MEM_UNSAFE=0
                         if [[ -n "${MEM_TIME_TO_LIMIT}" ]]; then
@@ -1002,34 +1025,31 @@ while kill -0 "${MPI_PID}" 2>/dev/null; do
 
                         if [[ "${MEM_UNSAFE}" -eq 1 ]]; then
                             MEMORY_BAD_SAMPLES=$(( MEMORY_BAD_SAMPLES + 1 ))
-                            mlog "[Monitor][Mem] Unsafe projection for ${MEMORY_BAD_SAMPLES} consecutive samples (threshold=${MEMORY_GUARD_PERSISTENCE_SAMPLES})"
+                            mlog "[Monitor][Mem] rss=${CURRENT_MAXRSS_KB}KB (${MEM_UTIL_PCT}%) | lim=${MEMORY_GUARD_TRIGGER_KB}KB | rate=${MEM_RATE_KBPS}KB/s | ttl=${MEM_TIME_TO_LIMIT}s < look=${MEM_LOOKAHEAD_SECONDS}s | STATUS: UNSAFE bad=${MEMORY_BAD_SAMPLES}/${MEMORY_GUARD_PERSISTENCE_SAMPLES}"
                             if [[ "${MEMORY_BAD_SAMPLES}" -ge "${MEMORY_GUARD_PERSISTENCE_SAMPLES}" ]]; then
                                 TRIGGER_REASON="MEMORY GUARD (MaxRSS projected to reach ${MEMORY_GUARD_TRIGGER_KB} KB in ${MEM_TIME_TO_LIMIT}s < ${MEM_LOOKAHEAD_SECONDS}s, persisted for ${MEMORY_BAD_SAMPLES} samples)"
                             fi
                         else
-                            [[ "${MEMORY_BAD_SAMPLES}" -gt 0 ]] && \
-                                mlog "[Monitor][Mem] Memory projection recovered. Resetting counter."
-                            MEMORY_BAD_SAMPLES=0
-                            mlog "[Monitor][Mem] maxrss=${CURRENT_MAXRSS_KB} KB | rate=${MEM_RATE_KBPS} KB/s | projection safe"
+                            [[ "${MEMORY_BAD_SAMPLES}" -gt 0 ]] && MEMORY_BAD_SAMPLES=0
+                            mlog "[Monitor][Mem] rss=${CURRENT_MAXRSS_KB}KB (${MEM_UTIL_PCT}%) | lim=${MEMORY_GUARD_TRIGGER_KB}KB | rate=${MEM_RATE_KBPS}KB/s | ttl=${MEM_TIME_TO_LIMIT}s > look=${MEM_LOOKAHEAD_SECONDS}s | STATUS: SAFE"
                         fi
                     fi
                 else
-                    [[ "${MEMORY_BAD_SAMPLES}" -gt 0 ]] && \
-                        mlog "[Monitor][Mem] Insufficient samples for rate. Resetting counter."
-                    MEMORY_BAD_SAMPLES=0
-                    mlog "[Monitor][Mem] Waiting for enough samples to compute growth rate."
+                    [[ "${MEMORY_BAD_SAMPLES}" -gt 0 ]] && MEMORY_BAD_SAMPLES=0
+                    mlog "[Monitor][Mem] rss=${CURRENT_MAXRSS_KB}KB (${MEM_UTIL_PCT}%) | lim=${MEMORY_GUARD_TRIGGER_KB}KB | STATUS: WARMING (need 2+ samples)"
                 fi
             fi
+        else
+            # Memory guard disabled - just log the sample
+            mlog "[Monitor][Mem] rss=${CURRENT_MAXRSS_KB}KB | STATUS: GUARD_DISABLED"
         fi
 
     else
         # sstat returned nothing — job step may not be registered yet
-        [[ "${MEMORY_BAD_SAMPLES}" -gt 0 ]] && \
-            mlog "[Monitor][Mem] sstat returned no data. Resetting memory counter."
-        MEMORY_BAD_SAMPLES=0
+        [[ "${MEMORY_BAD_SAMPLES}" -gt 0 ]] && MEMORY_BAD_SAMPLES=0
         MEM_EPOCH_HISTORY=()
         MEM_RSS_HISTORY=()
-        mlog "[Monitor][Mem] No sstat data yet (job step may not be registered)."
+        mlog "[Monitor][Mem] STATUS: NO_DATA (job step not registered yet)"
     fi
 
     # ------------------------------------------------------------------
@@ -1109,8 +1129,11 @@ while kill -0 "${MPI_PID}" 2>/dev/null; do
         STEPS_TO_DUMP=$(( T_RESTART_DUMP - STEPS_SINCE_DUMP ))
         TIME_NEEDED=$(echo "scale=2; ${SAFETY_FACTOR} * ${STEPS_TO_DUMP} * ${ELAPSED_PER_STEP}" | bc 2>/dev/null)
 
-        [[ -z "${TIME_NEEDED}" ]] && { mlog "[Monitor] WARNING: bc failed to compute TIME_NEEDED, skipping."; continue; }
-        mlog "[Monitor] TIDX=${CURRENT_TIDX} | to_dump=${STEPS_TO_DUMP} steps | s/step=${ELAPSED_PER_STEP} | source=${ELAPSED_SOURCE:-unknown} | avg_window=${ELAPSED_STEP_WINDOW} | left=${TIME_LEFT}s | needed=${TIME_NEEDED}s | idle=${IDLE_FOR}s"
+        [[ -z "${TIME_NEEDED}" ]] && { mlog "[Monitor][Time] WARNING: bc failed to compute TIME_NEEDED, skipping."; continue; }
+
+        # Format time per step for cleaner display
+        TIME_PER_STEP_FMT=$(echo "scale=1; ${ELAPSED_PER_STEP}" | bc 2>/dev/null)
+        TIME_NEEDED_FMT=$(echo "scale=0; ${TIME_NEEDED}" | bc 2>/dev/null)
 
         NOT_ENOUGH=$(echo "${TIME_LEFT} < ${TIME_NEEDED}" | bc 2>/dev/null)
         NOT_ENOUGH="${NOT_ENOUGH:-0}"
@@ -1118,19 +1141,28 @@ while kill -0 "${MPI_PID}" 2>/dev/null; do
         if [[ "${NOT_ENOUGH}" -eq 1 ]]; then
             ESTIMATE_BAD_SAMPLES=$(( ESTIMATE_BAD_SAMPLES + 1 ))
             ESTIMATE_LAST_BAD=1
-            mlog "[Monitor] Estimate unsafe for ${ESTIMATE_BAD_SAMPLES} consecutive samples (threshold=${ESTIMATE_PERSISTENCE_SAMPLES})"
+            mlog "[Monitor][Time] TIDX=${CURRENT_TIDX} | left=${TIME_LEFT}s < need=${TIME_NEEDED_FMT}s | dump_in=${STEPS_TO_DUMP} @ ${TIME_PER_STEP_FMT}s/step | STATUS: UNSAFE bad=${ESTIMATE_BAD_SAMPLES}/${ESTIMATE_PERSISTENCE_SAMPLES} | idle=${IDLE_FOR}s"
             if [[ "${ESTIMATE_BAD_SAMPLES}" -ge "${ESTIMATE_PERSISTENCE_SAMPLES}" ]]; then
                 TRIGGER_REASON="ESTIMATE persisted for ${ESTIMATE_BAD_SAMPLES} consecutive samples (${TIME_LEFT}s left < ${TIME_NEEDED}s needed)"
             fi
         else
             if [[ "${ESTIMATE_LAST_BAD}" -eq 1 || "${ESTIMATE_BAD_SAMPLES}" -gt 0 ]]; then
-                mlog "[Monitor] Estimate recovered. Resetting persistence counter."
+                mlog "[Monitor][Time] TIDX=${CURRENT_TIDX} | left=${TIME_LEFT}s > need=${TIME_NEEDED_FMT}s | dump_in=${STEPS_TO_DUMP} @ ${TIME_PER_STEP_FMT}s/step | STATUS: RECOVERED | idle=${IDLE_FOR}s"
+                ESTIMATE_BAD_SAMPLES=0
+                ESTIMATE_LAST_BAD=0
+            else
+                mlog "[Monitor][Time] TIDX=${CURRENT_TIDX} | left=${TIME_LEFT}s > need=${TIME_NEEDED_FMT}s | dump_in=${STEPS_TO_DUMP} @ ${TIME_PER_STEP_FMT}s/step | STATUS: SAFE | idle=${IDLE_FOR}s"
+                ESTIMATE_BAD_SAMPLES=0
+                ESTIMATE_LAST_BAD=0
             fi
-            ESTIMATE_BAD_SAMPLES=0
-            ESTIMATE_LAST_BAD=0
         fi
     else
-        mlog "[Monitor] Waiting for enough progress data | left=${TIME_LEFT}s | idle=${IDLE_FOR}s"
+        # No valid estimate yet
+        if [[ -n "${CURRENT_TIDX}" ]]; then
+            mlog "[Monitor][Time] TIDX=${CURRENT_TIDX} | left=${TIME_LEFT}s | STATUS: WARMING (insufficient progress data) | idle=${IDLE_FOR}s"
+        else
+            mlog "[Monitor][Time] TIDX=unknown | left=${TIME_LEFT}s | STATUS: WARMING (insufficient progress data) | idle=${IDLE_FOR}s"
+        fi
     fi
 
     if [[ -n "${CURRENT_TIDX}" && "${CURRENT_TIDX}" -gt "${LAST_TIDX}" ]]; then
