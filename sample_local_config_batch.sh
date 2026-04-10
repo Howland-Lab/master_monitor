@@ -1,9 +1,10 @@
+#!/bin/bash
+
 # ==============================================================================
 #  USER CONFIGURATION
 #  Adjust these variables each time you start a fresh simulation chain.
 # ==============================================================================
 
-#!/bin/bash
 #SBATCH --nodes=56
 #SBATCH --partition=compute
 #SBATCH --ntasks-per-node=64
