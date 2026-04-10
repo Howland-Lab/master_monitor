@@ -3,7 +3,7 @@
 #
 #  Date
 #  ----
-#  April 8, 2026
+#  April 10, 2026
 #
 #  Contact
 #  -------
@@ -24,9 +24,10 @@
 #    3) monitors progress through the solver output log and Slurm job metadata,
 #    4) estimates whether enough wall time remains to reach the next restart dump,
 #    5) watches for stalled/frozen jobs,
-#    6) watches node-level memory usage and projected memory growth,
-#    7) updates restart settings in the input files when needed, and
-#    8) submits a dependent child job so the simulation chain can continue.
+#    6) samples node-level memory usage via sstat each monitor cycle,
+#    7) appends memory samples to a per-job CSV file,
+#    8) updates restart settings in the input files when needed, and
+#    9) submits a dependent child job so the simulation chain can continue.
 #
 #  High-level behavior
 #  -------------------
@@ -45,6 +46,19 @@
 #    files to restart from that point, submits the next job in the chain, and
 #    terminates the current MPI launcher cleanly.
 #
+#  Logging
+#  -------
+#  All non-CSV messages are written to stdout, which Slurm captures in the
+#  job output log defined by the #SBATCH -o directive. There is no separate
+#  monitor log file. Memory samples are written to a per-job CSV file:
+#      memdiag_job${SLURM_JOB_ID}.csv
+#
+#  Memory sampling
+#  ---------------
+#  Memory is sampled once per monitor cycle (MONITOR_INTERVAL) via sstat.
+#  The same sample feeds both the CSV file and the in-loop memory guard logic.
+#  There is no separate background memory-watcher subshell.
+#
 #  Time-per-step estimate
 #  ----------------------
 #  The wall-time estimate used for restart decisions is taken preferentially
@@ -60,7 +74,7 @@
 #  - Input files are backed up before restart fields are modified.
 #  - Persistent-sample logic is used to avoid reacting to single noisy or
 #    transient bad estimates.
-#  - Memory monitoring uses live Slurm statistics and projected growth rather
+#  - Memory monitoring uses live sstat statistics and projected growth rather
 #    than reacting only after an out-of-memory failure occurs.
 #
 #  Expected inputs from the local job script
@@ -99,14 +113,15 @@ CONFIG_ABS="${JOB_CONFIG_ABS}"
 CONFIG_DIR="${JOB_CONFIG_DIR}"
 CONFIG_BASE="${JOB_CONFIG_BASE}"
 
-MONITOR_LOG="${CONFIG_DIR}/monitor_.log.${SLURM_JOB_ID}"
 THIS_SCRIPT="${CONFIG_ABS}"
 RESTART_LOCKFILE="${CONFIG_DIR}/.${CONFIG_BASE}.restart_lock"
+
+# CSV file for per-cycle memory samples
+MEM_CSV="${CONFIG_DIR}/memdiag_job${SLURM_JOB_ID}.csv"
 
 HARD_CUTOFF_SECONDS="${HARD_CUTOFF_SECONDS:-600}"
 SAFETY_FACTOR="${SAFETY_FACTOR:-1.2}"
 MONITOR_INTERVAL="${MONITOR_INTERVAL:-60}"
-MEMWATCH_INTERVAL="${MEMWATCH_INTERVAL:-300}"
 FROZEN_TIMEOUT_SECONDS="${FROZEN_TIMEOUT_SECONDS:-7200}"
 ESTIMATE_PERSISTENCE_SAMPLES="${ESTIMATE_PERSISTENCE_SAMPLES:-10}"
 
@@ -122,13 +137,14 @@ MEMORY_GUARD_UTILIZATION="${MEMORY_GUARD_UTILIZATION:-0.95}"
 # Example: 256 means 256 GB per node.
 MEMORY_GUARD_NODE_LIMIT_GB="${MEMORY_GUARD_NODE_LIMIT_GB:-256}"
 
-# Only restart if the memory projection is unsafe for 2 consecutive monitor cycles.
+# Only restart if the memory projection is unsafe for N consecutive monitor cycles.
 MEMORY_GUARD_PERSISTENCE_SAMPLES="${MEMORY_GUARD_PERSISTENCE_SAMPLES:-2}"
 
-# Compute the slope from up to the last 4 samples instead of just the last 2.
+# Compute the slope from up to the last N samples.
 MEMORY_RATE_WINDOW="${MEMORY_RATE_WINDOW:-4}"
 
-# When looking at the output log for elapsed time per step, consider a rolling average over this many previous steps
+# When looking at the output log for elapsed time per step, consider a rolling
+# average over this many previous steps.
 ELAPSED_STEP_WINDOW="${ELAPSED_STEP_WINDOW:-5}"
 
 # Parse wall-time from local case file
@@ -170,25 +186,14 @@ fi
 #  HELPERS
 # ==============================================================================
 
-cleanup_watchers() {
-    if [[ -n "${MEMWATCH_PID:-}" ]]; then
-        kill "${MEMWATCH_PID}" 2>/dev/null || true
-        wait "${MEMWATCH_PID}" 2>/dev/null || true
-        MEMWATCH_PID=""
-    fi
-
-    if [[ -n "${RSSWATCH_PID:-}" ]]; then
-        kill "${RSSWATCH_PID}" 2>/dev/null || true
-        wait "${RSSWATCH_PID}" 2>/dev/null || true
-        RSSWATCH_PID=""
-    fi
+# mlog: print a timestamped message to stdout (captured by Slurm into OUTPUT_LOG)
+mlog() {
+    printf '[%s] %s\n' "$(date '+%F %T')" "$*"
 }
 
 gb_to_kb() {
     local gb="$1"
-
     [[ -n "${gb}" ]] || return 1
-
     awk -v x="${gb}" '
         BEGIN {
             if (x ~ /^[0-9]+([.][0-9]+)?$/) {
@@ -228,13 +233,10 @@ get_first_allocated_node() {
 get_node_realmemory_kb() {
     local node="$1"
     local mem_mb
-
     [[ -n "${node}" ]] || return 1
-
     mem_mb="$(scontrol show node "${node}" 2>/dev/null \
         | tr ' ' '\n' \
         | awk -F= '$1=="RealMemory"{print $2; exit}')"
-
     [[ "${mem_mb}" =~ ^[0-9]+$ ]] || return 1
     echo $(( mem_mb * 1024 ))
 }
@@ -247,12 +249,9 @@ get_job_reqmem_raw() {
 
 get_job_reqmem_kb_per_node() {
     local reqmem raw num unit suffix total_kb
-
     reqmem="$(get_job_reqmem_raw)"
     [[ -n "${reqmem}" ]] || return 1
-
     raw="${reqmem}"
-
     if [[ "${raw}" =~ ^([0-9]+)([KMGT])([cn])$ ]]; then
         num="${BASH_REMATCH[1]}"
         unit="${BASH_REMATCH[2]}"
@@ -260,7 +259,6 @@ get_job_reqmem_kb_per_node() {
     else
         return 1
     fi
-
     case "${unit}" in
         K) total_kb=$(( num )) ;;
         M) total_kb=$(( num * 1024 )) ;;
@@ -268,12 +266,10 @@ get_job_reqmem_kb_per_node() {
         T) total_kb=$(( num * 1024 * 1024 * 1024 )) ;;
         *) return 1 ;;
     esac
-
     if [[ "${suffix}" == "n" ]]; then
         echo "${total_kb}"
         return 0
     fi
-
     if [[ "${suffix}" == "c" ]]; then
         local cpus_per_node
         cpus_per_node="${SLURM_JOB_CPUS_PER_NODE%%(*}"
@@ -281,12 +277,7 @@ get_job_reqmem_kb_per_node() {
         echo $(( total_kb * cpus_per_node ))
         return 0
     fi
-
     return 1
-}
-
-mlog() {
-    printf '[%s] %s\n' "$(date '+%F %T')" "$*" >> "${MONITOR_LOG}"
 }
 
 parse_slurm_time_to_seconds() {
@@ -315,16 +306,12 @@ parse_slurm_time_to_seconds() {
     fi
 
     if [[ -n "${f1}" && -n "${f2}" && -n "${f3}" ]]; then
-        hours="${f1}"
-        mins="${f2}"
-        secs="${f3}"
+        hours="${f1}"; mins="${f2}"; secs="${f3}"
     elif [[ -n "${f1}" && -n "${f2}" ]]; then
         if [[ "${t}" == *-* ]]; then
-            hours="${f1}"
-            mins="${f2}"
+            hours="${f1}"; mins="${f2}"
         else
-            mins="${f1}"
-            secs="${f2}"
+            mins="${f1}"; secs="${f2}"
         fi
     elif [[ -n "${f1}" ]]; then
         if [[ "${t}" == *-* ]]; then
@@ -349,8 +336,7 @@ parse_slurm_time_to_seconds() {
 
 get_recent_logged_elapsed_step_average() {
     local logfile="$1"
-    local lines_per_step_block tail_lines
-    local avg
+    local lines_per_step_block tail_lines avg
 
     [[ -f "${logfile}" ]] || return 1
 
@@ -371,43 +357,26 @@ get_recent_logged_elapsed_step_average() {
             }
             END {
                 if (n == 0) exit 1
-
                 start = n - want + 1
                 if (start < 1) start = 1
-
-                sum = 0
-                count = 0
-                for (i = start; i <= n; i++) {
-                    sum += vals[i]
-                    count++
-                }
-
-                if (count > 0) {
-                    printf "%.6f\n", sum / count
-                } else {
-                    exit 1
-                }
+                sum = 0; count = 0
+                for (i = start; i <= n; i++) { sum += vals[i]; count++ }
+                if (count > 0) printf "%.6f\n", sum / count
+                else exit 1
             }
         '
     )
 
     [[ -n "${avg}" ]] || return 1
-
-    if [[ "${avg}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
-        echo "${avg}"
-        return 0
-    fi
-
-    return 1
+    [[ "${avg}" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
+    echo "${avg}"
 }
 
 push_mem_sample() {
     local epoch="$1"
     local rss_kb="$2"
-
     MEM_EPOCH_HISTORY+=("${epoch}")
     MEM_RSS_HISTORY+=("${rss_kb}")
-
     while [[ "${#MEM_EPOCH_HISTORY[@]}" -gt "${MEMORY_RATE_WINDOW}" ]]; do
         MEM_EPOCH_HISTORY=("${MEM_EPOCH_HISTORY[@]:1}")
         MEM_RSS_HISTORY=("${MEM_RSS_HISTORY[@]:1}")
@@ -426,7 +395,6 @@ average_mem_rate_kbps() {
     for (( i=1; i<n; i++ )); do
         dt=$(( MEM_EPOCH_HISTORY[i] - MEM_EPOCH_HISTORY[i-1] ))
         drss=$(( MEM_RSS_HISTORY[i] - MEM_RSS_HISTORY[i-1] ))
-
         if [[ "${dt}" -gt 0 ]]; then
             [[ "${drss}" -lt 0 ]] && drss=0
             rate=$(echo "scale=6; ${drss} / ${dt}" | bc 2>/dev/null)
@@ -446,9 +414,8 @@ average_mem_rate_kbps() {
 parse_size_to_kb() {
     local s="$1"
     s="${s// /}"
-    s="${s%%%}"   # just in case
+    s="${s%%%}"
     [[ -z "${s}" || "${s}" == "0" || "${s}" == "Unknown" || "${s}" == "N/A" ]] && { echo 0; return 0; }
-
     awk -v x="${s}" '
         function scale(u) {
             if (u=="K" || u=="KB" || u=="KiB" || u=="") return 1
@@ -467,151 +434,75 @@ parse_size_to_kb() {
     '
 }
 
-get_peak_reported_maxrss_kb() {
-    local data line rss rss_kb peak=0
+# ==============================================================================
+#  MEMORY SAMPLING VIA SSTAT (called once per monitor cycle)
+#
+#  Returns: sets globals SSTAT_MAXRSS_KB, SSTAT_AVERSS_KB,
+#                         SSTAT_MAXVM_KB,  SSTAT_AVEVM_KB
+#  Appends one row to MEM_CSV.
+#  Returns 0 on success (at least one data row), 1 if sstat returned nothing.
+# ==============================================================================
 
-    data=$(sstat -j "${SLURM_JOB_ID}" --format=JobID,MaxRSS,MaxRSSTask \
-           --noheader 2>/dev/null || true)
-    [[ -z "${data}" ]] && { echo 0; return 0; }
+SSTAT_MAXRSS_KB=0
+SSTAT_AVERSS_KB=0
+SSTAT_MAXVM_KB=0
+SSTAT_AVEVM_KB=0
+
+sample_memory_sstat() {
+    local ts epoch data
+    local peak_maxrss=0 peak_averss=0 peak_maxvm=0 peak_avevm=0
+    local got_data=0
+
+    ts=$(date '+%F %T')
+    epoch=$(date +%s)
+
+    data=$(sstat -j "${SLURM_JOB_ID}" \
+        --format=JobID,MaxRSS,AveRSS,MaxVMSize,AveVMSize \
+        --noheader 2>/dev/null || true)
+
+    if [[ -z "${data}" ]] || ! echo "${data}" | grep -q '[^[:space:]]'; then
+        SSTAT_MAXRSS_KB=0
+        SSTAT_AVERSS_KB=0
+        SSTAT_MAXVM_KB=0
+        SSTAT_AVEVM_KB=0
+        return 1
+    fi
 
     while IFS= read -r line; do
         [[ -z "${line// /}" ]] && continue
-        rss="$(echo "${line}" | awk '{$1=$1; print $2}')"
-        rss="${rss//+}"
-        rss_kb="$(parse_size_to_kb "${rss}")"
-        [[ "${rss_kb}" =~ ^[0-9]+$ ]] || rss_kb=0
-        [[ "${rss_kb}" -gt "${peak}" ]] && peak="${rss_kb}"
+
+        local step maxrss averss maxvm avevm
+        read -r step maxrss averss maxvm avevm \
+            <<< "$(echo "${line}" | awk '{$1=$1; print $1, $2, $3, $4, $5}')"
+
+        maxrss=$(echo "${maxrss}" | sed 's/K$//; s/+*$//')
+        averss=$(echo "${averss}" | sed 's/K$//; s/+*$//')
+        maxvm=$(echo "${maxvm}"   | sed 's/K$//; s/+*$//')
+        avevm=$(echo "${avevm}"   | sed 's/K$//; s/+*$//')
+
+        local mrss arss mvm avm
+        mrss=$(parse_size_to_kb "${maxrss}"); [[ "${mrss}" =~ ^[0-9]+$ ]] || mrss=0
+        arss=$(parse_size_to_kb "${averss}"); [[ "${arss}" =~ ^[0-9]+$ ]] || arss=0
+        mvm=$(parse_size_to_kb  "${maxvm}");  [[ "${mvm}"  =~ ^[0-9]+$ ]] || mvm=0
+        avm=$(parse_size_to_kb  "${avevm}");  [[ "${avm}"  =~ ^[0-9]+$ ]] || avm=0
+
+        # Append this step row to CSV
+        echo "${ts},${epoch},${SLURM_JOB_ID},${step},${mrss},${arss},${mvm},${avm}" >> "${MEM_CSV}"
+
+        [[ "${mrss}" -gt "${peak_maxrss}" ]] && peak_maxrss="${mrss}"
+        [[ "${arss}" -gt "${peak_averss}" ]] && peak_averss="${arss}"
+        [[ "${mvm}"  -gt "${peak_maxvm}"  ]] && peak_maxvm="${mvm}"
+        [[ "${avm}"  -gt "${peak_avevm}"  ]] && peak_avevm="${avm}"
+        got_data=1
     done <<< "${data}"
 
-    echo "${peak}"
+    SSTAT_MAXRSS_KB="${peak_maxrss}"
+    SSTAT_AVERSS_KB="${peak_averss}"
+    SSTAT_MAXVM_KB="${peak_maxvm}"
+    SSTAT_AVEVM_KB="${peak_avevm}"
+
+    [[ "${got_data}" -eq 1 ]]
 }
-
-get_live_max_node_total_rss_kb() {
-    local out max_total=0 node total_rss max_proc nprocs
-
-    out=$(
-        timeout 30s srun --ntasks="${SLURM_NNODES}" --ntasks-per-node=1 bash -lc '
-            solver_base=$(basename "$solver")
-            rss_list=$(ps -eo comm=,rss= | awk -v s="$solver_base" '"'"'$1==s {print $2}'"'"')
-
-            if [[ -z "$rss_list" ]]; then
-                echo "$(hostname),0,0,0"
-            else
-                echo "$rss_list" | awk -v host="$(hostname)" "
-                    BEGIN{sum=0; max=0; n=0}
-                    {sum+=\$1; if (\$1>max) max=\$1; n++}
-                    END{print host \",\" sum \",\" max \",\" n}
-                "
-            fi
-        ' 2>/dev/null
-    ) || {
-        echo 0
-        return 0
-    }
-
-    [[ -n "${out}" ]] || {
-        echo 0
-        return 0
-    }
-
-    while IFS=, read -r node total_rss max_proc nprocs; do
-        [[ -n "${total_rss}" && "${total_rss}" =~ ^[0-9]+$ ]] || total_rss=0
-        if [[ "${total_rss}" -gt "${max_total}" ]]; then
-            max_total="${total_rss}"
-        fi
-    done <<< "${out}"
-
-    echo "${max_total}"
-}
-
-start_instant_rsswatch_job() {
-    local interval="${1:-300}"
-    local logfile
-
-    logfile="${CONFIG_DIR}/rssdiag_job${SLURM_JOB_ID}.csv"
-
-    (
-        if [[ ! -s "${logfile}" ]]; then
-            echo "timestamp,epoch,node,total_rss_kb,max_proc_rss_kb,num_solver_procs"
-        fi
-
-        sleep 20
-
-        while true; do
-            local ts epoch
-            ts=$(date '+%F %T')
-            epoch=$(date +%s)
-
-            if [[ -n "${MPI_PID:-}" ]] && ! kill -0 "${MPI_PID}" 2>/dev/null; then
-                break
-            fi
-
-            srun --ntasks="${SLURM_NNODES}" --ntasks-per-node=1 bash -lc '
-                solver_base=$(basename "$solver")
-                rss_list=$(ps -C "$solver_base" -o rss= 2>/dev/null)
-
-                if [[ -z "$rss_list" ]]; then
-                    echo "$(hostname),0,0,0"
-                else
-                    echo "$rss_list" | awk -v host="$(hostname)" "
-                        BEGIN{sum=0; max=0; n=0}
-                        {sum+=\$1; if (\$1>max) max=\$1; n++}
-                        END{print host \",\" sum \",\" max \",\" n}
-                    "
-                fi
-            ' 2>/dev/null | awk -v ts="${ts}" -v epoch="${epoch}" -F, '
-                NF==4 { print ts "," epoch "," $0 }
-            '
-
-            sleep "${interval}"
-        done
-    ) >> "${logfile}" &
-    
-    RSSWATCH_PID=$!
-    mlog "[RSSWatch] Started for job ${SLURM_JOB_ID}"
-    mlog "[RSSWatch] CSV log : ${logfile}"
-    mlog "[RSSWatch] PID     : ${RSSWATCH_PID}"
-}
-
-WALL_TIME_SECONDS=$(parse_slurm_time_to_seconds "${WALL_TIME_STR}") || {
-    echo "[ERROR] Failed to parse wall-time string: ${WALL_TIME_STR}" >&2
-    exit 1
-}
-
-MEMORY_GUARD_NODE_LIMIT_RESOLVED_KB=0
-MEMORY_GUARD_TRIGGER_KB=0
-
-if [[ "${MEMORY_GUARD_ENABLED}" -eq 1 ]]; then
-    USER_NODE_LIMIT_KB=0
-    SLURM_NODE_LIMIT_KB=0
-    SLURM_REQMEM_NODE_KB=0
-
-    if [[ -n "${MEMORY_GUARD_NODE_LIMIT_GB:-}" ]]; then
-        USER_NODE_LIMIT_KB="$(gb_to_kb "${MEMORY_GUARD_NODE_LIMIT_GB}")" || {
-            mlog "[ERROR] Invalid MEMORY_GUARD_NODE_LIMIT_GB='${MEMORY_GUARD_NODE_LIMIT_GB}'"
-            exit 1
-        }
-    fi
-
-    FIRST_NODE="$(get_first_allocated_node || true)"
-    if [[ -n "${FIRST_NODE}" ]]; then
-        SLURM_NODE_LIMIT_KB="$(get_node_realmemory_kb "${FIRST_NODE}" || echo 0)"
-    fi
-
-    SLURM_REQMEM_NODE_KB="$(get_job_reqmem_kb_per_node || echo 0)"
-
-    MEMORY_GUARD_NODE_LIMIT_RESOLVED_KB="$(min_positive \
-        "${USER_NODE_LIMIT_KB}" \
-        "${SLURM_NODE_LIMIT_KB}" \
-        "${SLURM_REQMEM_NODE_KB}")"
-
-    if [[ "${MEMORY_GUARD_NODE_LIMIT_RESOLVED_KB}" =~ ^[0-9]+$ ]] && [[ "${MEMORY_GUARD_NODE_LIMIT_RESOLVED_KB}" -gt 0 ]]; then
-        MEMORY_GUARD_TRIGGER_KB=$(awk -v lim="${MEMORY_GUARD_NODE_LIMIT_RESOLVED_KB}" -v frac="${MEMORY_GUARD_UTILIZATION}" \
-            'BEGIN { printf "%.0f\n", lim * frac }')
-    else
-        MEMORY_GUARD_ENABLED=0
-    fi
-fi
 
 get_file_mtime_epoch() {
     local f="$1"
@@ -625,7 +516,6 @@ get_file_mtime_epoch() {
 submit_from_config() {
     local dependency_mode="${1:-none}"
     local dependency_jobid="${2:-}"
-
     if [[ "${dependency_mode}" == "afterany" ]]; then
         sbatch --dependency="afterany:${dependency_jobid}" "${THIS_SCRIPT}"
     else
@@ -638,122 +528,23 @@ submit_with_retry() {
     local dependency_jobid="${2:-}"
     local max_retries="${3:-3}"
     local sleep_seconds="${4:-10}"
-
-    local attempt=1
-    local out child_id
+    local attempt=1 out child_id
 
     while [[ "${attempt}" -le "${max_retries}" ]]; do
         out="$(submit_from_config "${dependency_mode}" "${dependency_jobid}" 2>&1 || true)"
         child_id="$(echo "${out}" | awk '{print $NF}')"
-
         if [[ "${child_id}" =~ ^[0-9]+$ ]]; then
             echo "${child_id}"
             return 0
         fi
-
         mlog "[Submit] Attempt ${attempt}/${max_retries} failed."
         mlog "[Submit] sbatch output: ${out}"
-
         if [[ "${attempt}" -lt "${max_retries}" ]]; then
             sleep "${sleep_seconds}"
         fi
         attempt=$(( attempt + 1 ))
     done
-
     return 1
-}
-
-start_memwatch_job() {
-    local interval="${1:-300}"
-    local logfile debuglog
-
-    if [[ -z "${SLURM_JOB_ID:-}" ]]; then
-        mlog "[MemWatch] ERROR: SLURM_JOB_ID is not set."
-        return 1
-    fi
-
-    if ! [[ "${interval}" =~ ^[0-9]+$ ]] || [[ "${interval}" -le 0 ]]; then
-        mlog "[MemWatch] ERROR: interval must be a positive integer, got '${interval}'."
-        return 1
-    fi
-
-    logfile="${CONFIG_DIR}/memdiag_job${SLURM_JOB_ID}.csv"
-    debuglog="${CONFIG_DIR}/memdiag_job${SLURM_JOB_ID}.log"
-
-    (
-        # FD 3 → debug/comment log, FD 1 → csv (inherited from outer redirect)
-        exec 3>> "${debuglog}"
-
-        dlog() { echo "[MemWatch] $(date '+%F %T') $*" >&3; }
-
-        if [[ ! -s "${logfile}" ]]; then
-            echo "timestamp,epoch,jobid,step,maxrss(KB),averss(KB),maxvmsize(KB),avevmsize(KB)"
-        fi
-
-        sleep 10 
-        while true; do
-            local ts epoch data
-            ts=$(date '+%F %T')
-            epoch=$(date +%s)
-
-            data=$(sstat -j "${SLURM_JOB_ID}" \
-                --format=JobID,MaxRSS,AveRSS,MaxVMSize,AveVMSize \
-                --noheader 2>/dev/null || true)
-
-            if [[ -n "${data}" ]] && echo "${data}" | grep -q '[^[:space:]]'; then
-                while IFS= read -r line; do
-                    [[ -z "${line// /}" ]] && continue
-
-                    local step maxrss averss maxvm avevm
-                    read -r step maxrss averss maxvm avevm \
-                        <<< "$(echo "${line}" | awk '{$1=$1; print $1, $2, $3, $4, $5}')"
-
-                    maxrss=$(echo "${maxrss}" | sed 's/K$//; s/+*$//')
-                    averss=$(echo "${averss}" | sed 's/K$//; s/+*$//')
-                    maxvm=$(echo "${maxvm}"   | sed 's/K$//; s/+*$//')
-                    avevm=$(echo "${avevm}"   | sed 's/K$//; s/+*$//')
-
-                    # Numeric data row → stdout → csv
-                    echo "${ts},${epoch},${SLURM_JOB_ID},${step},${maxrss},${averss},${maxvm},${avevm}"
-                done <<< "${data}"
-
-            else
-                dlog "no_live_sstat_data jobid=${SLURM_JOB_ID}"
-
-                if [[ -n "${MPI_PID:-}" ]] && kill -0 "${MPI_PID}" 2>/dev/null; then
-                    dlog "job still running; sstat not ready yet, retrying"
-                    sleep "${interval}"
-                    continue
-                fi
-
-                dlog "job appears finished; collecting final sacct summary"
-
-                sacct -j "${SLURM_JOB_ID}" \
-                    --format=JobID,Elapsed,MaxRSS,MaxVMSize,ReqMem,State \
-                    --noheader 2>/dev/null \
-                | awk -v ts="${ts}" -v epoch="${epoch}" '
-                    NF {
-                        $1=$1
-                        gsub(/[[:space:]]+/, ",")
-                        print "[MemWatch] sacct_summary ts=" ts " epoch=" epoch " " $0
-                    }
-                ' >&3 || true
-
-                break
-            fi
-
-            sleep "${interval}"
-        done
-
-        dlog "subshell exiting."
-
-    ) >> "${logfile}" &
-
-    MEMWATCH_PID=$!
-    mlog "[MemWatch] Started for job ${SLURM_JOB_ID}"
-    mlog "[MemWatch] CSV log   : ${logfile}"
-    mlog "[MemWatch] Debug log : ${debuglog}"
-    mlog "[MemWatch] PID       : ${MEMWATCH_PID}"
 }
 
 parse_namelist_value() {
@@ -816,12 +607,9 @@ set_namelist_value() {
 }
 
 latest_common_restart_tid() {
-    local dir1="$1"
-    local rid1="$2"
-    local dir2="$3"
-    local rid2="$4"
-
+    local dir1="$1" rid1="$2" dir2="$3" rid2="$4"
     local list1 list2
+
     list1=$(find "${dir1}" -maxdepth 1 -type f \
                 -name "RESTART_Run${rid1}_info.??????" \
                 -printf "%f\n" 2>/dev/null \
@@ -841,8 +629,6 @@ latest_common_restart_tid() {
         return 0
     fi
 
-    # Both lists are already numerically sorted; comm needs them lexicographically sorted too,
-    # which for plain integers (no padding) is the same ordering
     comm -12 <(echo "${list1}" | sort) <(echo "${list2}" | sort) | sort -n | tail -1
 }
 
@@ -872,17 +658,64 @@ release_restart_lock() {
     rm -f "${RESTART_LOCKFILE}" 2>/dev/null || true
 }
 
+cleanup_watchers() {
+    : # no background watchers in the unified design; kept for EXIT trap symmetry
+}
+
 validate_integer "${MEMORY_GUARD_LOOKAHEAD_INTERVALS}" "MEMORY_GUARD_LOOKAHEAD_INTERVALS"
 validate_integer "${MEMORY_GUARD_PERSISTENCE_SAMPLES}" "MEMORY_GUARD_PERSISTENCE_SAMPLES"
 validate_integer "${MEMORY_RATE_WINDOW}" "MEMORY_RATE_WINDOW"
 validate_integer "${ELAPSED_STEP_WINDOW}" "ELAPSED_STEP_WINDOW"
-[[ "${HARD_CUTOFF_SECONDS}" =~ ^[0-9]+$ ]] || { mlog "[ERROR] HARD_CUTOFF_SECONDS must be an integer"; exit 1; }
-[[ "${SAFETY_FACTOR}" =~ ^[0-9]+([.][0-9]+)?$ ]] || { mlog "[ERROR] SAFETY_FACTOR must be a number"; exit 1; }
-[[ "${MEMORY_GUARD_LOOKAHEAD_INTERVALS}" -gt 0 ]] || { mlog "[ERROR] MEMORY_GUARD_LOOKAHEAD_INTERVALS must be > 0"; exit 1; }
-[[ "${MEMORY_GUARD_PERSISTENCE_SAMPLES}" -gt 0 ]] || { mlog "[ERROR] MEMORY_GUARD_PERSISTENCE_SAMPLES must be > 0"; exit 1; }
-[[ "${MEMORY_RATE_WINDOW}" -ge 2 ]] || { mlog "[ERROR] MEMORY_RATE_WINDOW must be >= 2"; exit 1; }
-[[ "${ELAPSED_STEP_WINDOW}" -ge 1 ]] || { mlog "[ERROR] ELAPSED_STEP_WINDOW must be >= 1"; exit 1; }
+[[ "${HARD_CUTOFF_SECONDS}" =~ ^[0-9]+$ ]]          || { mlog "[ERROR] HARD_CUTOFF_SECONDS must be an integer"; exit 1; }
+[[ "${SAFETY_FACTOR}" =~ ^[0-9]+([.][0-9]+)?$ ]]    || { mlog "[ERROR] SAFETY_FACTOR must be a number"; exit 1; }
+[[ "${MEMORY_GUARD_LOOKAHEAD_INTERVALS}" -gt 0 ]]   || { mlog "[ERROR] MEMORY_GUARD_LOOKAHEAD_INTERVALS must be > 0"; exit 1; }
+[[ "${MEMORY_GUARD_PERSISTENCE_SAMPLES}" -gt 0 ]]   || { mlog "[ERROR] MEMORY_GUARD_PERSISTENCE_SAMPLES must be > 0"; exit 1; }
+[[ "${MEMORY_RATE_WINDOW}" -ge 2 ]]                 || { mlog "[ERROR] MEMORY_RATE_WINDOW must be >= 2"; exit 1; }
+[[ "${ELAPSED_STEP_WINDOW}" -ge 1 ]]                || { mlog "[ERROR] ELAPSED_STEP_WINDOW must be >= 1"; exit 1; }
 
+WALL_TIME_SECONDS=$(parse_slurm_time_to_seconds "${WALL_TIME_STR}") || {
+    echo "[ERROR] Failed to parse wall-time string: ${WALL_TIME_STR}" >&2
+    exit 1
+}
+
+# Resolve memory guard limits
+MEMORY_GUARD_NODE_LIMIT_RESOLVED_KB=0
+MEMORY_GUARD_TRIGGER_KB=0
+
+if [[ "${MEMORY_GUARD_ENABLED}" -eq 1 ]]; then
+    USER_NODE_LIMIT_KB=0
+    SLURM_NODE_LIMIT_KB=0
+    SLURM_REQMEM_NODE_KB=0
+
+    if [[ -n "${MEMORY_GUARD_NODE_LIMIT_GB:-}" ]]; then
+        USER_NODE_LIMIT_KB="$(gb_to_kb "${MEMORY_GUARD_NODE_LIMIT_GB}")" || {
+            mlog "[ERROR] Invalid MEMORY_GUARD_NODE_LIMIT_GB='${MEMORY_GUARD_NODE_LIMIT_GB}'"
+            exit 1
+        }
+    fi
+
+    FIRST_NODE="$(get_first_allocated_node || true)"
+    if [[ -n "${FIRST_NODE}" ]]; then
+        SLURM_NODE_LIMIT_KB="$(get_node_realmemory_kb "${FIRST_NODE}" || echo 0)"
+    fi
+
+    SLURM_REQMEM_NODE_KB="$(get_job_reqmem_kb_per_node || echo 0)"
+
+    MEMORY_GUARD_NODE_LIMIT_RESOLVED_KB="$(min_positive \
+        "${USER_NODE_LIMIT_KB}" \
+        "${SLURM_NODE_LIMIT_KB}" \
+        "${SLURM_REQMEM_NODE_KB}")"
+
+    if [[ "${MEMORY_GUARD_NODE_LIMIT_RESOLVED_KB}" =~ ^[0-9]+$ ]] && \
+       [[ "${MEMORY_GUARD_NODE_LIMIT_RESOLVED_KB}" -gt 0 ]]; then
+        MEMORY_GUARD_TRIGGER_KB=$(awk \
+            -v lim="${MEMORY_GUARD_NODE_LIMIT_RESOLVED_KB}" \
+            -v frac="${MEMORY_GUARD_UTILIZATION}" \
+            'BEGIN { printf "%.0f\n", lim * frac }')
+    else
+        MEMORY_GUARD_ENABLED=0
+    fi
+fi
 
 # ==============================================================================
 #  PARSE AND VALIDATE INPUTS
@@ -943,6 +776,7 @@ mlog "Mem slurm real/node : ${SLURM_NODE_LIMIT_KB:-0} KB"
 mlog "Mem slurm req/node  : ${SLURM_REQMEM_NODE_KB:-0} KB"
 mlog "Mem limit/node      : ${MEMORY_GUARD_NODE_LIMIT_RESOLVED_KB} KB"
 mlog "Mem trigger/node    : ${MEMORY_GUARD_TRIGGER_KB} KB"
+mlog "Mem CSV             : ${MEM_CSV}"
 mlog "Script path     : ${THIS_SCRIPT}"
 mlog "Primary input   : ${PRIMARY_INPUTFILE}"
 mlog "Precursor input : ${PRECURSOR_INPUTFILE}"
@@ -982,9 +816,9 @@ _update_input_files() {
     set_namelist_value "${PRECURSOR_INPUTFILE}" "restartFile_RID"  "${PRECURSOR_RUNID}" || return 1
 
     mlog "[Update] PRIMARY   — verified restart fields:"
-    grep -iE 'useRestartFile|restartFile_TID|restartFile_RID' "${PRIMARY_INPUTFILE}" >> "${MONITOR_LOG}"
+    grep -iE 'useRestartFile|restartFile_TID|restartFile_RID' "${PRIMARY_INPUTFILE}"
     mlog "[Update] PRECURSOR — verified restart fields:"
-    grep -iE 'useRestartFile|restartFile_TID|restartFile_RID' "${PRECURSOR_INPUTFILE}" >> "${MONITOR_LOG}"
+    grep -iE 'useRestartFile|restartFile_TID|restartFile_RID' "${PRECURSOR_INPUTFILE}"
 }
 
 _restore_input_files() {
@@ -1062,9 +896,8 @@ trap cleanup_watchers EXIT
 #  LAUNCH
 # ==============================================================================
 
-mlog "================================================================"
-mlog "Launching memory watcher for job ${SLURM_JOB_ID}..."
-start_memwatch_job "${MEMWATCH_INTERVAL}"
+# Write CSV header
+echo "timestamp,epoch,jobid,step,maxrss(KB),averss(KB),maxvmsize(KB),avevmsize(KB)" > "${MEM_CSV}"
 
 mlog "Launching MPI simulation..."
 run_job
@@ -1078,9 +911,7 @@ JOB_START_EPOCH=$(date +%s)
 
 mlog "MPI PID         : ${MPI_PID}"
 mlog "Clock started."
-
-# mlog "Launching instantaneous RSS watcher for job ${SLURM_JOB_ID}..."
-# start_instant_rsswatch_job "${MEMWATCH_INTERVAL}"
+mlog "Memory CSV      : ${MEM_CSV}"
 
 # ==============================================================================
 #  MONITOR LOOP
@@ -1120,52 +951,42 @@ while kill -0 "${MPI_PID}" 2>/dev/null; do
     TRIGGER_REASON=""
     CURRENT_TIDX=""
 
-    CURRENT_PEAK_NODE_RSS_KB="$(get_peak_reported_maxrss_kb)"
-    CURRENT_LIVE_NODE_RSS_KB="$(get_live_max_node_total_rss_kb)"
+    # ------------------------------------------------------------------
+    #  MEMORY SAMPLING — one sstat call per cycle feeds CSV + guard logic
+    # ------------------------------------------------------------------
+
     MEM_LOOKAHEAD_SECONDS=$(( MEMORY_GUARD_LOOKAHEAD_INTERVALS * MONITOR_INTERVAL ))
 
-    if [[ "${MEMORY_GUARD_ENABLED}" -eq 1 && "${MEMORY_GUARD_TRIGGER_KB}" -gt 0 ]]; then
+    if sample_memory_sstat; then
+        CURRENT_MAXRSS_KB="${SSTAT_MAXRSS_KB}"
 
-        # Hard backstop: if Slurm-reported peak is already above threshold, trigger on persistence.
-        if [[ -n "${CURRENT_PEAK_NODE_RSS_KB}" && \
-            "${CURRENT_PEAK_NODE_RSS_KB}" =~ ^[0-9]+$ && \
-            "${CURRENT_PEAK_NODE_RSS_KB}" -ge "${MEMORY_GUARD_TRIGGER_KB}" ]]; then
+        mlog "[Monitor][Mem] sstat maxrss=${CURRENT_MAXRSS_KB} KB | averss=${SSTAT_AVERSS_KB} KB | maxvm=${SSTAT_MAXVM_KB} KB"
 
-            MEMORY_BAD_SAMPLES=$(( MEMORY_BAD_SAMPLES + 1 ))
-            mlog "[Monitor][Mem] peak_node_maxrss=${CURRENT_PEAK_NODE_RSS_KB} KB already above trigger=${MEMORY_GUARD_TRIGGER_KB} KB | bad=${MEMORY_BAD_SAMPLES}/${MEMORY_GUARD_PERSISTENCE_SAMPLES}"
+        if [[ "${MEMORY_GUARD_ENABLED}" -eq 1 && "${MEMORY_GUARD_TRIGGER_KB}" -gt 0 ]]; then
 
-            if [[ "${MEMORY_BAD_SAMPLES}" -ge "${MEMORY_GUARD_PERSISTENCE_SAMPLES}" ]]; then
-                TRIGGER_REASON="MEMORY GUARD (peak node-level MaxRSS ${CURRENT_PEAK_NODE_RSS_KB} KB >= trigger ${MEMORY_GUARD_TRIGGER_KB} KB for ${MEMORY_BAD_SAMPLES} consecutive samples)"
-            fi
+            # Hard backstop: current RSS already at/above trigger
+            if [[ "${CURRENT_MAXRSS_KB}" -ge "${MEMORY_GUARD_TRIGGER_KB}" ]]; then
+                MEMORY_BAD_SAMPLES=$(( MEMORY_BAD_SAMPLES + 1 ))
+                mlog "[Monitor][Mem] maxrss=${CURRENT_MAXRSS_KB} KB >= trigger=${MEMORY_GUARD_TRIGGER_KB} KB | bad=${MEMORY_BAD_SAMPLES}/${MEMORY_GUARD_PERSISTENCE_SAMPLES}"
+                if [[ "${MEMORY_BAD_SAMPLES}" -ge "${MEMORY_GUARD_PERSISTENCE_SAMPLES}" ]]; then
+                    TRIGGER_REASON="MEMORY GUARD (MaxRSS ${CURRENT_MAXRSS_KB} KB >= trigger ${MEMORY_GUARD_TRIGGER_KB} KB for ${MEMORY_BAD_SAMPLES} consecutive samples)"
+                fi
 
-        # Projection path: use live node-total RSS.
-        elif [[ -n "${CURRENT_LIVE_NODE_RSS_KB}" && \
-                "${CURRENT_LIVE_NODE_RSS_KB}" =~ ^[0-9]+$ && \
-                "${CURRENT_LIVE_NODE_RSS_KB}" -gt 0 ]]; then
+            # Projection path
+            else
+                push_mem_sample "${NOW_EPOCH}" "${CURRENT_MAXRSS_KB}"
+                MEM_RATE_KBPS="$(average_mem_rate_kbps || true)"
 
-            push_mem_sample "${NOW_EPOCH}" "${CURRENT_LIVE_NODE_RSS_KB}"
-            MEM_RATE_KBPS="$(average_mem_rate_kbps || true)"
-
-            if [[ -n "${MEM_RATE_KBPS}" ]]; then
-                if [[ "$(echo "${MEM_RATE_KBPS} <= 0" | bc 2>/dev/null)" -eq 1 ]]; then
-                    if [[ "${MEMORY_BAD_SAMPLES}" -gt 0 ]]; then
-                        mlog "[Monitor][Mem] Live node-memory projection recovered. Resetting memory persistence counter."
-                    fi
-                    MEMORY_BAD_SAMPLES=0
-                    mlog "[Monitor][Mem] live_node=${CURRENT_LIVE_NODE_RSS_KB} KB | rate_avg=${MEM_RATE_KBPS} KB/s | flat/decreasing"
-                else
-                    if [[ "${CURRENT_LIVE_NODE_RSS_KB}" -ge "${MEMORY_GUARD_TRIGGER_KB}" ]]; then
-                        MEMORY_BAD_SAMPLES=$(( MEMORY_BAD_SAMPLES + 1 ))
-                        mlog "[Monitor][Mem] live_node=${CURRENT_LIVE_NODE_RSS_KB} KB already at/above trigger=${MEMORY_GUARD_TRIGGER_KB} KB | bad=${MEMORY_BAD_SAMPLES}/${MEMORY_GUARD_PERSISTENCE_SAMPLES}"
-                        if [[ "${MEMORY_BAD_SAMPLES}" -ge "${MEMORY_GUARD_PERSISTENCE_SAMPLES}" ]]; then
-                            TRIGGER_REASON="MEMORY GUARD (live node RSS ${CURRENT_LIVE_NODE_RSS_KB} KB >= trigger ${MEMORY_GUARD_TRIGGER_KB} KB, persisted for ${MEMORY_BAD_SAMPLES} samples)"
-                        fi
+                if [[ -n "${MEM_RATE_KBPS}" ]]; then
+                    if [[ "$(echo "${MEM_RATE_KBPS} <= 0" | bc 2>/dev/null)" -eq 1 ]]; then
+                        [[ "${MEMORY_BAD_SAMPLES}" -gt 0 ]] && \
+                            mlog "[Monitor][Mem] Memory projection recovered. Resetting counter."
+                        MEMORY_BAD_SAMPLES=0
+                        mlog "[Monitor][Mem] maxrss=${CURRENT_MAXRSS_KB} KB | rate=${MEM_RATE_KBPS} KB/s | flat/decreasing"
                     else
-                        MEM_HEADROOM_KB=$(( MEMORY_GUARD_TRIGGER_KB - CURRENT_LIVE_NODE_RSS_KB ))
+                        MEM_HEADROOM_KB=$(( MEMORY_GUARD_TRIGGER_KB - CURRENT_MAXRSS_KB ))
                         MEM_TIME_TO_LIMIT=$(echo "scale=2; ${MEM_HEADROOM_KB} / ${MEM_RATE_KBPS}" | bc 2>/dev/null)
-                        [[ -z "${MEM_TIME_TO_LIMIT}" ]] && MEM_TIME_TO_LIMIT=""
-
-                        mlog "[Monitor][Mem] live_node=${CURRENT_LIVE_NODE_RSS_KB} KB | trigger=${MEMORY_GUARD_TRIGGER_KB} KB | rate_avg=${MEM_RATE_KBPS} KB/s | ttl=${MEM_TIME_TO_LIMIT}s | lookahead=${MEM_LOOKAHEAD_SECONDS}s"
+                        mlog "[Monitor][Mem] maxrss=${CURRENT_MAXRSS_KB} KB | trigger=${MEMORY_GUARD_TRIGGER_KB} KB | rate=${MEM_RATE_KBPS} KB/s | ttl=${MEM_TIME_TO_LIMIT}s | lookahead=${MEM_LOOKAHEAD_SECONDS}s"
 
                         MEM_UNSAFE=0
                         if [[ -n "${MEM_TIME_TO_LIMIT}" ]]; then
@@ -1175,37 +996,39 @@ while kill -0 "${MPI_PID}" 2>/dev/null; do
 
                         if [[ "${MEM_UNSAFE}" -eq 1 ]]; then
                             MEMORY_BAD_SAMPLES=$(( MEMORY_BAD_SAMPLES + 1 ))
-                            mlog "[Monitor][Mem] Unsafe live node-memory projection for ${MEMORY_BAD_SAMPLES} consecutive samples (threshold=${MEMORY_GUARD_PERSISTENCE_SAMPLES})"
+                            mlog "[Monitor][Mem] Unsafe projection for ${MEMORY_BAD_SAMPLES} consecutive samples (threshold=${MEMORY_GUARD_PERSISTENCE_SAMPLES})"
                             if [[ "${MEMORY_BAD_SAMPLES}" -ge "${MEMORY_GUARD_PERSISTENCE_SAMPLES}" ]]; then
-                                TRIGGER_REASON="MEMORY GUARD (live max node RSS projected to reach ${MEMORY_GUARD_TRIGGER_KB} KB in ${MEM_TIME_TO_LIMIT}s, less than ${MEM_LOOKAHEAD_SECONDS}s, persisted for ${MEMORY_BAD_SAMPLES} samples)"
+                                TRIGGER_REASON="MEMORY GUARD (MaxRSS projected to reach ${MEMORY_GUARD_TRIGGER_KB} KB in ${MEM_TIME_TO_LIMIT}s < ${MEM_LOOKAHEAD_SECONDS}s, persisted for ${MEMORY_BAD_SAMPLES} samples)"
                             fi
                         else
-                            if [[ "${MEMORY_BAD_SAMPLES}" -gt 0 ]]; then
-                                mlog "[Monitor][Mem] Live node-memory projection recovered. Resetting memory persistence counter."
-                            fi
+                            [[ "${MEMORY_BAD_SAMPLES}" -gt 0 ]] && \
+                                mlog "[Monitor][Mem] Memory projection recovered. Resetting counter."
                             MEMORY_BAD_SAMPLES=0
-                            mlog "[Monitor][Mem] live_node=${CURRENT_LIVE_NODE_RSS_KB} KB | rate_avg=${MEM_RATE_KBPS} KB/s | projection safe"
+                            mlog "[Monitor][Mem] maxrss=${CURRENT_MAXRSS_KB} KB | rate=${MEM_RATE_KBPS} KB/s | projection safe"
                         fi
                     fi
+                else
+                    [[ "${MEMORY_BAD_SAMPLES}" -gt 0 ]] && \
+                        mlog "[Monitor][Mem] Insufficient samples for rate. Resetting counter."
+                    MEMORY_BAD_SAMPLES=0
+                    mlog "[Monitor][Mem] Waiting for enough samples to compute growth rate."
                 fi
-            else
-                if [[ "${MEMORY_BAD_SAMPLES}" -gt 0 ]]; then
-                    mlog "[Monitor][Mem] Insufficient live node-memory samples/rate. Resetting memory persistence counter."
-                fi
-                MEMORY_BAD_SAMPLES=0
-                mlog "[Monitor][Mem] Waiting for enough live node-memory samples to compute growth rate."
             fi
-
-        else
-            if [[ "${MEMORY_BAD_SAMPLES}" -gt 0 ]]; then
-                mlog "[Monitor][Mem] No live node-memory sample available. Resetting memory persistence counter."
-            fi
-            MEMORY_BAD_SAMPLES=0
-            MEM_EPOCH_HISTORY=()
-            MEM_RSS_HISTORY=()
-            mlog "[Monitor][Mem] No live node-memory sample available from per-node RSS probe."
         fi
+
+    else
+        # sstat returned nothing — job step may not be registered yet
+        [[ "${MEMORY_BAD_SAMPLES}" -gt 0 ]] && \
+            mlog "[Monitor][Mem] sstat returned no data. Resetting memory counter."
+        MEMORY_BAD_SAMPLES=0
+        MEM_EPOCH_HISTORY=()
+        MEM_RSS_HISTORY=()
+        mlog "[Monitor][Mem] No sstat data yet (job step may not be registered)."
     fi
+
+    # ------------------------------------------------------------------
+    #  OUTPUT LOG PROGRESS TRACKING
+    # ------------------------------------------------------------------
 
     if [[ ! -f "${OUTPUT_LOG}" ]]; then
         mlog "[Monitor] Output log not yet visible, waiting..."
@@ -1238,7 +1061,6 @@ while kill -0 "${MPI_PID}" 2>/dev/null; do
     if [[ -n "${CURRENT_TIDX}" && "${CURRENT_TIDX}" -gt "${LAST_TIDX}" ]]; then
         STEP_DELTA=$(( CURRENT_TIDX - LAST_TIDX ))
 
-        # Preferred path: solver-reported elapsed time from the log
         LOGGED_ELAPSED_AVG="$(get_recent_logged_elapsed_step_average "${OUTPUT_LOG}" || true)"
         if [[ -n "${LOGGED_ELAPSED_AVG}" ]]; then
             ELAPSED_PER_STEP="${LOGGED_ELAPSED_AVG}"
@@ -1246,7 +1068,6 @@ while kill -0 "${MPI_PID}" 2>/dev/null; do
             ELAPSED_SOURCE="log_avg"
         fi
 
-        # Fallback path: coarse wall-time inference if log timing is unavailable
         if [[ "${ELAPSED_PER_STEP_VALID}" -eq 0 ]]; then
             global_wall_time=$(( NOW_EPOCH - LAST_TIDX_EPOCH ))
             if [[ "${LAST_TIDX_EPOCH}" -gt 0 && "${STEP_DELTA}" -gt 0 && "${global_wall_time}" -gt 0 ]]; then
@@ -1266,6 +1087,10 @@ while kill -0 "${MPI_PID}" 2>/dev/null; do
     if [[ "${LAST_PROGRESS_EPOCH}" -gt 0 ]]; then
         IDLE_FOR=$(( NOW_EPOCH - LAST_PROGRESS_EPOCH ))
     fi
+
+    # ------------------------------------------------------------------
+    #  TRIGGER EVALUATION
+    # ------------------------------------------------------------------
 
     if [[ -z "${TRIGGER_REASON}" && "${LAST_PROGRESS_EPOCH}" -gt 0 && "${IDLE_FOR}" -ge "${FROZEN_TIMEOUT_SECONDS}" ]]; then
         TRIGGER_REASON="FROZEN (no log/TIDX progress for ${IDLE_FOR}s >= ${FROZEN_TIMEOUT_SECONDS}s)"
@@ -1288,7 +1113,6 @@ while kill -0 "${MPI_PID}" 2>/dev/null; do
             ESTIMATE_BAD_SAMPLES=$(( ESTIMATE_BAD_SAMPLES + 1 ))
             ESTIMATE_LAST_BAD=1
             mlog "[Monitor] Estimate unsafe for ${ESTIMATE_BAD_SAMPLES} consecutive samples (threshold=${ESTIMATE_PERSISTENCE_SAMPLES})"
-
             if [[ "${ESTIMATE_BAD_SAMPLES}" -ge "${ESTIMATE_PERSISTENCE_SAMPLES}" ]]; then
                 TRIGGER_REASON="ESTIMATE persisted for ${ESTIMATE_BAD_SAMPLES} consecutive samples (${TIME_LEFT}s left < ${TIME_NEEDED}s needed)"
             fi
@@ -1307,6 +1131,10 @@ while kill -0 "${MPI_PID}" 2>/dev/null; do
         LAST_TIDX="${CURRENT_TIDX}"
         LAST_TIDX_EPOCH="${NOW_EPOCH}"
     fi
+
+    # ------------------------------------------------------------------
+    #  RESTART ACTION
+    # ------------------------------------------------------------------
 
     if [[ -n "${TRIGGER_REASON}" && "${CHILD_SUBMITTED}" -eq 0 ]]; then
         mlog "================================================================"

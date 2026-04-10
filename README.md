@@ -33,7 +33,7 @@ That said, the overall design is not specific to PadeOps alone. With modest chan
 
 ### Automatic chained resubmission
 
-When the current job is no longer safe to continue, the script prepares a restart and submits a dependent child job so the simulation can continue automatically.
+When the current job is no longer safe to continue, the script prepares a restart and submits a child job so the simulation can continue automatically.
 
 ### Restart-aware continuation
 
@@ -55,13 +55,13 @@ If elapsed-step timings are not available in the log, the script falls back to a
 
 If the output log stops updating or no progress is detected for too long, the script assumes the job is stalled and triggers a restart.
 
-### Memory growth monitoring
+### Unified memory sampling and guard logic
 
-The script monitors live Slurm memory statistics and can trigger an early restart if node-level memory usage is projected to hit an unsafe threshold before the next monitoring interval.
+The script samples Slurm memory statistics once per main monitor cycle via `sstat`. The same sample is used both to append a row to the per-job memory CSV and to drive the in-loop memory-guard projection logic.
 
 ### Restart lock protection
 
-A lock file prevents duplicate restart actions from competing trigger paths such as timeout logic, memory guard logic, and SIGTERM handling.
+A lock file prevents duplicate restart actions from competing trigger paths such as timeout logic, memory-guard logic, and SIGTERM handling.
 
 ### Backup and restore of input files
 
@@ -88,18 +88,6 @@ It is not limited to one solver, but it assumes your simulation has the followin
 
 ---
 
-## Repository Structure
-
-A typical setup looks like this:
-
-```text
-repo/
-├── master_monitor.sh
-├── README.md
-└── examples/
-    └── local_case_job.sh
-```
-
 ### `master_monitor.sh`
 
 The shared monitoring and auto-resubmission logic.
@@ -115,7 +103,8 @@ A case-specific batch script that contains:
 * input-file path,
 * environment setup file,
 * monitoring parameters,
-* launcher function such as `mpirun` or `ibrun`.
+* path to the shared master monitor body,
+* launcher function such as `mpirun`, `ibrun`, or `srun`.
 
 This local script is the actual object submitted with `sbatch`, and it is also the script resubmitted for all child jobs.
 
@@ -130,7 +119,7 @@ The local job script sets:
 * Slurm directives,
 * case-specific variables,
 * the platform-specific `run_job()` function,
-* paths to the input file, solver, and environment setup.
+* paths to the input file, solver, environment setup file, and master monitor body.
 
 At the end of the local script, it resolves its own path and sources the master monitor body.
 
@@ -173,7 +162,7 @@ The script edits the input files so the next job starts from that restart point.
 
 ### 7. A child job is submitted
 
-The next job in the chain is submitted through Slurm, optionally with dependency on the current job.
+The next job in the chain is submitted through Slurm.
 
 ### 8. The current simulation is terminated cleanly
 
@@ -181,143 +170,22 @@ After successful child submission, the current MPI launcher is terminated and th
 
 ---
 
-## Typical Local Job Script
+## Memory Sampling and CSV Output
 
-A case-specific Slurm script may look like this:
+Memory is sampled once per monitor cycle via `sstat`.
 
-```bash
-#!/bin/bash
-#SBATCH --nodes=56
-#SBATCH --partition=wide
-#SBATCH --ntasks-per-node=64
-#SBATCH --cpus-per-task=1
-#SBATCH --exclusive
-#SBATCH --time=12:00:00
-#SBATCH --job-name=spinfarm250
-#SBATCH --output=output_.o%j
-#SBATCH --error=error_.e%j
+Each successful sampling cycle appends rows to a per-job CSV file of the form:
 
-MAIN_INPUTFILE="/path/to/input_main.dat"
-SOLVER="/path/to/solver_binary"
-SOURCEDFILE="/path/to/setup_environment.sh"
-MASTER_MONITOR_SCRIPT="/path/to/master_monitor.sh"
-
-SAFETY_FACTOR=1.5
-MONITOR_INTERVAL=60
-MEMWATCH_INTERVAL=300
-HARD_CUTOFF_SECONDS=600
-FROZEN_TIMEOUT_SECONDS=7200
-ESTIMATE_PERSISTENCE_SAMPLES=10
-MEMORY_GUARD_ENABLED=1
-MEMORY_GUARD_LOOKAHEAD_INTERVALS=2
-MEMORY_GUARD_UTILIZATION=0.9
-MEMORY_GUARD_NODE_LIMIT_GB=256
-MEMORY_GUARD_PERSISTENCE_SAMPLES=2
-MEMORY_RATE_WINDOW=4
-ELAPSED_STEP_WINDOW=5
-
-run_job() {
-    mpirun -np "${SLURM_NTASKS}" "${solver}" "${inputFile}" &
-    MPI_PID=$!
-}
-
-# ===========================
-# End of user-defined section
-# ===========================
-
-JOB_CONFIG_CMD="$(scontrol show job -o "${SLURM_JOB_ID}" | tr ' ' '\n' | awk -F= '$1=="Command"{print $2; exit}')"
-
-if [[ -z "${JOB_CONFIG_CMD}" ]]; then
-    echo "[ERROR] Could not determine config file path from scontrol for job ${SLURM_JOB_ID}" >&2
-    exit 1
-fi
-
-if [[ "${JOB_CONFIG_CMD}" = /* ]]; then
-    JOB_CONFIG_ABS="${JOB_CONFIG_CMD}"
-else
-    JOB_CONFIG_ABS="${SLURM_SUBMIT_DIR}/${JOB_CONFIG_CMD}"
-fi
-
-JOB_CONFIG_ABS="$(realpath "${JOB_CONFIG_ABS}")"
-
-if [[ -z "${JOB_CONFIG_ABS}" || ! -f "${JOB_CONFIG_ABS}" ]]; then
-    echo "[ERROR] Resolved config file does not exist: ${JOB_CONFIG_ABS}" >&2
-    exit 1
-fi
-
-JOB_CONFIG_DIR="$(dirname "${JOB_CONFIG_ABS}")"
-JOB_CONFIG_BASE="$(basename "${JOB_CONFIG_ABS}")"
-
-source "${MASTER_MONITOR_SCRIPT}"
+```text
+memdiag_job${SLURM_JOB_ID}.csv
 ```
 
-Submit it with:
+The same `sstat` sample is used for two purposes:
 
-```bash
-sbatch local_case_job.sh
-```
+1. appending memory diagnostics to the CSV file,
+2. evaluating whether memory growth is projected to hit an unsafe threshold soon enough to justify a proactive restart.
 
----
-
-## Key Configuration Variables
-
-### Core paths
-
-* `MAIN_INPUTFILE`
-  Path to the main simulation input file.
-
-* `SOLVER`
-  Path to the solver executable.
-
-* `SOURCEDFILE`
-  Environment setup script for modules, paths, compilers, MPI, and dependencies.
-
-* `MASTER_MONITOR_SCRIPT`
-  Path to the shared monitoring script body.
-
-### Runtime estimation
-
-* `SAFETY_FACTOR`
-  Multiplies the projected time needed to reach the next restart dump.
-
-* `MONITOR_INTERVAL`
-  How often the monitor loop wakes up.
-
-* `ELAPSED_STEP_WINDOW`
-  Number of recent elapsed-step timings to average from the output log.
-
-* `ESTIMATE_PERSISTENCE_SAMPLES`
-  Number of consecutive unsafe estimates required before a restart is triggered.
-
-### Frozen-run protection
-
-* `FROZEN_TIMEOUT_SECONDS`
-  Maximum allowed time without meaningful progress before the run is treated as stalled.
-
-### Hard wall-time protection
-
-* `HARD_CUTOFF_SECONDS`
-  Last-resort threshold below which restart is forced regardless of time-per-step estimate.
-
-### Memory guard
-
-* `MEMORY_GUARD_ENABLED`
-  Enable or disable memory monitoring.
-
-* `MEMORY_GUARD_LOOKAHEAD_INTERVALS`
-  Number of monitor intervals to look ahead when projecting memory growth.
-
-* `MEMORY_GUARD_UTILIZATION`
-  Fraction of the inferred memory limit at which the run is considered unsafe.
-
-* `MEMORY_GUARD_NODE_LIMIT_GB`
-  Optional explicit node memory limit override.
-
-* `MEMORY_GUARD_PERSISTENCE_SAMPLES`
-  Number of consecutive unsafe memory projections required before restart.
-
-* `MEMORY_RATE_WINDOW`
-  Number of recent memory samples used to estimate growth rate.
+This keeps the logging and the restart decision logic synchronized.
 
 ---
 
@@ -425,13 +293,13 @@ Before large runs, test the workflow on a short case and verify:
 
 1. the local script submits successfully with `sbatch`,
 2. the solver launches correctly,
-3. the monitor log is written,
-4. the output log is correctly identified,
-5. elapsed-step timings are being parsed,
-6. restart files are detected correctly,
-7. input-file restart fields are edited as expected,
-8. child jobs resubmit the same local case script,
-9. the environment setup works in both parent and child jobs.
+3. the Slurm output log is correctly identified,
+4. elapsed-step timings are being parsed,
+5. restart files are detected correctly,
+6. input-file restart fields are edited as expected,
+7. child jobs resubmit the same local case script,
+8. the environment setup works in both parent and child jobs,
+9. the memory CSV is being written as expected.
 
 ---
 
@@ -454,9 +322,3 @@ Users working with different restart conventions may need to adapt helper functi
 For questions, issues, or maintenance inquiries:
 
 **[karimali@mit.edu](mailto:karimali@mit.edu)**
-
----
-
-## Date
-
-**April 8, 2026**
