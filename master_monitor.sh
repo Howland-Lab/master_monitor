@@ -147,6 +147,11 @@ MEMORY_GUARD_LOOKAHEAD_INTERVALS="${MEMORY_GUARD_LOOKAHEAD_INTERVALS:-2}"
 # 1.0 means "at the limit"; 0.95 means "95% of the limit".
 MEMORY_GUARD_UTILIZATION="${MEMORY_GUARD_UTILIZATION:-0.95}"
 
+# Critical utilization fraction for immediate hard stop (no persistence required).
+# When memory reaches this fraction of the limit, restart immediately without waiting.
+# Example: 0.97 means 97% of the memory limit.
+MEMORY_GUARD_HARD_STOP_FRAC="${MEMORY_GUARD_HARD_STOP_FRAC:-0.97}"
+
 # Explicit per-node memory limit in GB used by the memory guard.
 # Example: 256 means 256 GB per node.
 MEMORY_GUARD_NODE_LIMIT_GB="${MEMORY_GUARD_NODE_LIMIT_GB:-256}"
@@ -375,7 +380,7 @@ get_recent_logged_elapsed_step_average() {
                 if (start < 1) start = 1
                 sum = 0; count = 0
                 for (i = start; i <= n; i++) { sum += vals[i]; count++ }
-                if (count > 0) printf "%.6f\n", sum / count
+                if (count > 0) printf "%.2f\n", sum / count
                 else exit 1
             }
         '
@@ -411,15 +416,15 @@ average_mem_rate_kbps() {
         drss=$(( MEM_RSS_HISTORY[i] - MEM_RSS_HISTORY[i-1] ))
         if [[ "${dt}" -gt 0 ]]; then
             [[ "${drss}" -lt 0 ]] && drss=0
-            rate=$(echo "scale=6; ${drss} / ${dt}" | bc 2>/dev/null)
+            rate=$(echo "scale=2; ${drss} / ${dt}" | bc 2>/dev/null)
             [[ -n "${rate}" ]] || continue
-            sum=$(echo "scale=6; ${sum} + ${rate}" | bc 2>/dev/null)
+            sum=$(echo "scale=2; ${sum} + ${rate}" | bc 2>/dev/null)
             count=$(( count + 1 ))
         fi
     done
 
     if [[ "${count}" -gt 0 ]]; then
-        echo "scale=6; ${sum} / ${count}" | bc 2>/dev/null
+        echo "scale=2; ${sum} / ${count}" | bc 2>/dev/null
     else
         echo ""
     fi
@@ -687,6 +692,10 @@ validate_integer "${ELAPSED_STEP_WINDOW}" "ELAPSED_STEP_WINDOW"
 [[ "${MEMORY_RATE_WINDOW}" -ge 2 ]]                 || { mlog "[ERROR] MEMORY_RATE_WINDOW must be >= 2"; exit 1; }
 [[ "${ELAPSED_STEP_WINDOW}" -ge 1 ]]                || { mlog "[ERROR] ELAPSED_STEP_WINDOW must be >= 1"; exit 1; }
 [[ "${MONITOR_SETTLE_TIME}" =~ ^[0-9]+$ ]]          || { mlog "[ERROR] MONITOR_SETTLE_TIME must be an integer"; exit 1; }
+[[ "${MEMORY_GUARD_HARD_STOP_FRAC}" =~ ^[0-9]+([.][0-9]+)?$ ]] || { mlog "[ERROR] MEMORY_GUARD_HARD_STOP_FRAC must be a number"; exit 1; }
+# Validate that the fraction is between 0 and 1
+HARD_STOP_CHECK=$(echo "${MEMORY_GUARD_HARD_STOP_FRAC} > 0 && ${MEMORY_GUARD_HARD_STOP_FRAC} <= 1" | bc 2>/dev/null)
+[[ "${HARD_STOP_CHECK}" -eq 1 ]] || { mlog "[ERROR] MEMORY_GUARD_HARD_STOP_FRAC must be between 0 and 1 (e.g., 0.97 for 97%)"; exit 1; }
 
 WALL_TIME_SECONDS=$(parse_slurm_time_to_seconds "${WALL_TIME_STR}") || {
     echo "[ERROR] Failed to parse wall-time string: ${WALL_TIME_STR}" >&2
@@ -784,6 +793,8 @@ mlog "Safety factor   : ${SAFETY_FACTOR}x"
 mlog "Memory guard    : ${MEMORY_GUARD_ENABLED}"
 mlog "Mem lookahead   : ${MEMORY_GUARD_LOOKAHEAD_INTERVALS} intervals"
 mlog "Mem util frac   : ${MEMORY_GUARD_UTILIZATION}"
+MEMORY_GUARD_HARD_STOP_PCT_DISPLAY=$(awk -v frac="${MEMORY_GUARD_HARD_STOP_FRAC}" 'BEGIN { printf "%.0f", frac * 100 }')
+mlog "Mem hard stop   : ${MEMORY_GUARD_HARD_STOP_FRAC} (${MEMORY_GUARD_HARD_STOP_PCT_DISPLAY}%)"
 mlog "Mem persist     : ${MEMORY_GUARD_PERSISTENCE_SAMPLES} samples"
 mlog "Mem rate window : ${MEMORY_RATE_WINDOW} samples"
 mlog "Mem user limit/node : ${MEMORY_GUARD_NODE_LIMIT_GB:-unset} GB (${USER_NODE_LIMIT_KB:-0} KB)"
@@ -833,9 +844,9 @@ _update_input_files() {
     set_namelist_value "${PRECURSOR_INPUTFILE}" "restartFile_RID"  "${PRECURSOR_RUNID}" || return 1
 
     mlog "[Update] PRIMARY   — verified restart fields:"
-    grep -iE 'useRestartFile|restartFile_TID|restartFile_RID' "${PRIMARY_INPUTFILE}"
+    grep -iE 'useRestartFile|restartFile_TID|restartFile_RID' "${PRIMARY_INPUTFILE}" >> "${MONITOR_LOG}"
     mlog "[Update] PRECURSOR — verified restart fields:"
-    grep -iE 'useRestartFile|restartFile_TID|restartFile_RID' "${PRECURSOR_INPUTFILE}"
+    grep -iE 'useRestartFile|restartFile_TID|restartFile_RID' "${PRECURSOR_INPUTFILE}" >> "${MONITOR_LOG}"
 }
 
 _restore_input_files() {
@@ -996,8 +1007,15 @@ while kill -0 "${MPI_PID}" 2>/dev/null; do
 
         if [[ "${MEMORY_GUARD_ENABLED}" -eq 1 && "${MEMORY_GUARD_TRIGGER_KB}" -gt 0 ]]; then
 
+            # HARD STOP: immediate restart at critical utilization (no persistence required)
+            # Convert fraction to percentage for comparison
+            MEMORY_GUARD_HARD_STOP_PCT=$(awk -v frac="${MEMORY_GUARD_HARD_STOP_FRAC}" 'BEGIN { printf "%.0f", frac * 100 }')
+            if [[ "${MEM_UTIL_PCT}" -ge "${MEMORY_GUARD_HARD_STOP_PCT}" ]]; then
+                mlog "[Monitor][Mem] rss=${CURRENT_MAXRSS_KB}KB (${MEM_UTIL_PCT}%) | lim=${MEMORY_GUARD_TRIGGER_KB}KB | STATUS: CRITICAL_HARD_STOP"
+                TRIGGER_REASON="MEMORY GUARD HARD STOP (MaxRSS at ${MEM_UTIL_PCT}% >= ${MEMORY_GUARD_HARD_STOP_PCT}% critical threshold)"
+                
             # Hard backstop: current RSS already at/above trigger
-            if [[ "${CURRENT_MAXRSS_KB}" -ge "${MEMORY_GUARD_TRIGGER_KB}" ]]; then
+            elif [[ "${CURRENT_MAXRSS_KB}" -ge "${MEMORY_GUARD_TRIGGER_KB}" ]]; then
                 MEMORY_BAD_SAMPLES=$(( MEMORY_BAD_SAMPLES + 1 ))
                 mlog "[Monitor][Mem] rss=${CURRENT_MAXRSS_KB}KB (${MEM_UTIL_PCT}%) | lim=${MEMORY_GUARD_TRIGGER_KB}KB | STATUS: AT_LIMIT bad=${MEMORY_BAD_SAMPLES}/${MEMORY_GUARD_PERSISTENCE_SAMPLES}"
                 if [[ "${MEMORY_BAD_SAMPLES}" -ge "${MEMORY_GUARD_PERSISTENCE_SAMPLES}" ]]; then
@@ -1097,7 +1115,7 @@ while kill -0 "${MPI_PID}" 2>/dev/null; do
         if [[ "${ELAPSED_PER_STEP_VALID}" -eq 0 ]]; then
             global_wall_time=$(( NOW_EPOCH - LAST_TIDX_EPOCH ))
             if [[ "${LAST_TIDX_EPOCH}" -gt 0 && "${STEP_DELTA}" -gt 0 && "${global_wall_time}" -gt 0 ]]; then
-                ELAPSED_PER_STEP=$(echo "scale=6; ${global_wall_time} / ${STEP_DELTA}" | bc 2>/dev/null)
+                ELAPSED_PER_STEP=$(echo "scale=2; ${global_wall_time} / ${STEP_DELTA}" | bc 2>/dev/null)
                 [[ -n "${ELAPSED_PER_STEP}" ]] && ELAPSED_PER_STEP_VALID=1
                 ELAPSED_SOURCE="wall"
             fi

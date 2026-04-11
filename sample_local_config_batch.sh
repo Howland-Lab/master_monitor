@@ -70,6 +70,11 @@ MEMORY_GUARD_NODE_LIMIT_GB=256
 # Example: 0.95 means trigger logic is based on 95% of the node limit.
 MEMORY_GUARD_UTILIZATION=0.95
 
+# Critical utilization fraction for immediate hard stop (no persistence required).
+# When memory reaches this fraction of the limit, restart immediately without waiting.
+# Example: 0.97 means 97% of the memory limit.
+MEMORY_GUARD_HARD_STOP_FRAC=0.97
+
 # Restart if projected MaxRSS would reach the trigger within this many future
 # monitor intervals.
 # Example: with MONITOR_INTERVAL=60 and LOOKAHEAD_INTERVALS=3, the guard asks
