@@ -823,8 +823,501 @@ mlog "Job startup complete."
 #  INPUT UPDATE HELPERS
 # ==============================================================================
 
+# Extract a complete namelist section from a Fortran input file
+# More robust - handles trailing comments and extra whitespace
+parse_namelist_section() {
+    local file="$1"
+    local namelist="$2"
+    
+    if [[ ! -f "${file}" ]]; then
+        return 1
+    fi
+    
+    awk -v nl="${namelist}" '
+        BEGIN { in_section = 0; IGNORECASE = 1 }
+        $0 ~ ("^[[:space:]]*&" nl "([[:space:]]|!|$)") { in_section = 1; next }
+        in_section && $0 ~ /^[[:space:]]*\// { exit }
+        in_section { print }
+    ' "${file}"
+}
+
+# Parse a value from a namelist section (passed as string)
+parse_budget_value() {
+    local section="$1"
+    local key="$2"
+    
+    echo "${section}" | awk -v key="${key}" '
+        BEGIN { IGNORECASE = 1 }
+        $0 ~ ("^[[:space:]]*" key "[[:space:]]*=") {
+            sub(/^[[:space:]]*[^=]*=[[:space:]]*/, "")
+            gsub(/[[:space:]]/, "")
+            gsub(/["\047]/, "")  # Remove quotes
+            sub(/!.*/, "")       # Remove comments
+            sub(/,$/, "")        # Remove trailing comma
+            print
+            exit
+        }
+    '
+}
+
+# Get expected field counts for budget types
+get_budget_deficit_compact_field_count() {
+    local budget_num="$1"
+    case "${budget_num}" in
+        0) echo 20 ;;
+        1) echo 15 ;;
+        2) echo 15 ;;
+        3) echo 19 ;;
+        *) echo 0 ;;
+    esac
+}
+
+# Find ALL valid (tidx,counter) pairs for a deficit compact budget
+find_all_deficit_compact_budget_states() {
+    local budget_dir="$1"
+    local rid_pad="$2"
+    local budget_num="$3"
+    local max_tidx="$4"
+    
+    local field_count=$(get_budget_deficit_compact_field_count "${budget_num}")
+    [[ "${field_count}" -eq 0 ]] && return 1
+    
+    local pattern="Run${rid_pad}_comp_deficit_budget${budget_num}_term*_t??????_n??????.s3D"
+    
+    # Get unique TIDXs, sorted descending
+    local tidx_list=$(find "${budget_dir}" -maxdepth 1 -name "${pattern}" 2>/dev/null \
+        | sed 's/.*_t\([0-9]\{6\}\)_n.*/\1/' \
+        | sort -rn \
+        | uniq)
+    
+    [[ -z "${tidx_list}" ]] && return 1
+    
+    # Find all complete (tidx,counter) pairs
+    while IFS= read -r tidx; do
+        local tidx_num=$((10#${tidx}))
+        
+        # Safety: must be strictly less than latest simulation TIDX
+        [[ "${tidx_num}" -ge "${max_tidx}" ]] && continue
+        
+        # Count files for this TIDX
+        local file_count=$(find "${budget_dir}" -maxdepth 1 \
+            -name "Run${rid_pad}_comp_deficit_budget${budget_num}_term??_t${tidx}_n??????.s3D" \
+            2>/dev/null | wc -l)
+        
+        if [[ "${file_count}" -eq "${field_count}" ]]; then
+            local counter=$(find "${budget_dir}" -maxdepth 1 \
+                -name "Run${rid_pad}_comp_deficit_budget${budget_num}_term*_t${tidx}_n??????.s3D" \
+                2>/dev/null | head -1 | sed 's/.*_n\([0-9]\{6\}\)\.s3D/\1/')
+            
+            local counter_num=$((10#${counter}))
+            echo "${tidx_num},${counter_num}"
+        fi
+    done <<< "${tidx_list}"
+}
+
+# Find ALL valid (tidx,counter) pairs for time avg budget
+find_all_time_avg_budget_states() {
+    local budget_dir="$1"
+    local rid_pad="$2"
+    local budget_type="$3"
+    local max_tidx="$4"
+    
+    # For budgetType=0, check budget0 with terms 1-16,26,31
+    if [[ "${budget_type}" == "0" ]]; then
+        local required_terms="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 26 31"
+        local pattern="Run${rid_pad}_budget0_term??_t??????_n??????.s3D"
+        
+        local tidx_list=$(find "${budget_dir}" -maxdepth 1 -name "${pattern}" 2>/dev/null \
+            | sed 's/.*_t\([0-9]\{6\}\)_n.*/\1/' \
+            | sort -rn \
+            | uniq)
+        
+        [[ -z "${tidx_list}" ]] && return 1
+        
+        while IFS= read -r tidx; do
+            local tidx_num=$((10#${tidx}))
+            
+            [[ "${tidx_num}" -ge "${max_tidx}" ]] && continue
+            
+            local all_present=1
+            for term in ${required_terms}; do
+                local term_pad=$(printf "%02d" "${term}")
+                local file_pattern="Run${rid_pad}_budget0_term${term_pad}_t${tidx}_n??????.s3D"
+                local file_count=$(find "${budget_dir}" -maxdepth 1 -name "${file_pattern}" 2>/dev/null | wc -l)
+                
+                if [[ "${file_count}" -eq 0 ]]; then
+                    all_present=0
+                    break
+                fi
+            done
+            
+            if [[ "${all_present}" -eq 1 ]]; then
+                local counter=$(find "${budget_dir}" -maxdepth 1 \
+                    -name "Run${rid_pad}_budget0_term??_t${tidx}_n??????.s3D" \
+                    2>/dev/null | head -1 | sed 's/.*_n\([0-9]\{6\}\)\.s3D/\1/')
+                
+                local counter_num=$((10#${counter}))
+                echo "${tidx_num},${counter_num}"
+            fi
+        done <<< "${tidx_list}"
+    fi
+}
+
+# Find common (tidx,counter) from multiple budget state lists
+find_common_budget_state() {
+    local -n state_lists=$1  # Array of state strings (one per budget)
+    
+    [[ "${#state_lists[@]}" -eq 0 ]] && return 1
+    
+    # If only one budget, return its latest state
+    if [[ "${#state_lists[@]}" -eq 1 ]]; then
+        echo "${state_lists[0]}" | head -1
+        return 0
+    fi
+    
+    # Find intersection of all state lists
+    local common_states="${state_lists[0]}"
+    
+    for ((i=1; i<${#state_lists[@]}; i++)); do
+        common_states=$(comm -12 \
+            <(echo "${common_states}" | sort) \
+            <(echo "${state_lists[i]}" | sort))
+        
+        [[ -z "${common_states}" ]] && return 1
+    done
+    
+    # Return the latest (first in descending order)
+    echo "${common_states}" | sort -t, -k1,1rn -k2,2rn | head -1
+}
+
+# Explicitly disable budget restart in a namelist
+disable_budget_restart() {
+    local file="$1"
+    local namelist="$2"
+    
+    set_namelist_value_in_section "${file}" "${namelist}" "restart_budgets" ".false." || return 1
+    set_namelist_value_in_section "${file}" "${namelist}" "restart_rid" "0" || return 1
+    set_namelist_value_in_section "${file}" "${namelist}" "restart_tid" "0" || return 1
+    set_namelist_value_in_section "${file}" "${namelist}" "restart_counter" "0" || return 1
+    
+    return 0
+}
+
+# Update budget restart settings in a namelist
+update_budget_namelist() {
+    local file="$1"
+    local namelist="$2"
+    local restart_rid="$3"
+    local restart_tid="$4"
+    local restart_counter="$5"
+    
+    set_namelist_value_in_section "${file}" "${namelist}" "restart_budgets" ".true." || return 1
+    set_namelist_value_in_section "${file}" "${namelist}" "restart_rid" "${restart_rid}" || return 1
+    set_namelist_value_in_section "${file}" "${namelist}" "restart_tid" "${restart_tid}" || return 1
+    set_namelist_value_in_section "${file}" "${namelist}" "restart_counter" "${restart_counter}" || return 1
+    
+    return 0
+}
+
+# Set value in specific namelist section
+set_namelist_value_in_section() {
+    local file="$1"
+    local namelist="$2"
+    local key="$3"
+    local new_val="$4"
+    local tmpfile="${file}.tmp.$$"
+    
+    awk -v nl="${namelist}" -v key="${key}" -v val="${new_val}" '
+    BEGIN { in_section = 0; found = 0; section_seen = 0; IGNORECASE = 1 }
+    
+    $0 ~ ("^[[:space:]]*&" nl "([[:space:]]|!|$)") {
+        in_section = 1
+        section_seen = 1
+        print
+        next
+    }
+    
+    in_section && $0 ~ /^[[:space:]]*\// {
+        in_section = 0
+        if (!found) {
+            print "    " key " = " val
+        }
+        print
+        next
+    }
+    
+    in_section && tolower($0) ~ ("^[[:space:]]*" tolower(key) "[[:space:]]*=") {
+        match($0, /^[[:space:]]*/)
+        indent = substr($0, 1, RLENGTH)
+        print indent key " = " val
+        found = 1
+        next
+    }
+    
+    { print }
+    
+    END {
+        if (!section_seen) {
+            print "[ERROR] Namelist section &" nl " not found in file" > "/dev/stderr"
+            exit 2
+        }
+    }
+    ' "${file}" > "${tmpfile}"
+    
+    local awk_exit=$?
+    if [[ ${awk_exit} -ne 0 ]]; then
+        rm -f "${tmpfile}"
+        return 1
+    fi
+    
+    mv "${tmpfile}" "${file}"
+}
+
+# Resolve budget directory path
+# - Empty or unset: defaults to CONFIG_DIR (where job script is located)
+# - Set: used as-is (expected to be absolute path)
+resolve_budget_dir() {
+    local budget_dir="$1"
+    
+    # If empty, use CONFIG_DIR
+    if [[ -z "${budget_dir}" ]]; then
+        echo "${CONFIG_DIR}"
+        return 0
+    fi
+    
+    # Otherwise return as-is (should be absolute)
+    echo "${budget_dir}"
+}
+
+# Process budget restarts for a single input file
+# Mode: "discover" = find constraints, return min TIDX via stdout, don't update files
+#       "update"   = update files with budget restarts, return nothing
+# Returns 0 on success, 1 on failure (in update mode)
+# Note: In discover mode, the return value is via stdout (command substitution).
+#       All diagnostics use mlog() to avoid stdout pollution.
+process_budget_restarts_for_file() {
+    local input_file="$1"
+    local file_label="$2"
+    local runid="$3"
+    local rid_pad="$4"
+    local max_tidx="$5"
+    local mode="${6:-discover}"  # "discover" or "update"
+    
+    local min_budget_tidx=""
+    local update_failed=0
+    
+    if [[ "${mode}" == "discover" ]]; then
+        mlog "[Budget][${file_label}] Discovering budget constraints (max_tidx=${max_tidx})..."
+    else
+        mlog "[Budget][${file_label}] Updating budget restart settings (max_tidx=${max_tidx})..."
+    fi
+    
+    # Process BUDGET_TIME_AVG_DEFICIT_COMPACT
+    local section=$(parse_namelist_section "${input_file}" "BUDGET_TIME_AVG_DEFICIT_COMPACT")
+    if [[ -n "${section}" ]]; then
+        local do_budgets=$(parse_budget_value "${section}" "do_budgets")
+        
+        if [[ "${do_budgets}" == ".true." || "${do_budgets}" == ".TRUE." ]]; then
+            if [[ "${mode}" == "discover" ]]; then
+                mlog "[Budget][${file_label}] BUDGET_TIME_AVG_DEFICIT_COMPACT is active"
+            fi
+            
+            local budget_dir_raw=$(parse_budget_value "${section}" "budgets_dir")
+            local budget_dir=$(resolve_budget_dir "${budget_dir_raw}")
+            
+            if [[ ! -d "${budget_dir}" ]]; then
+                mlog "[Budget][${file_label}] WARNING: DEFICIT_COMPACT budget directory not found: ${budget_dir}"
+                if [[ "${mode}" == "update" ]]; then
+                    mlog "[Budget][${file_label}] Disabling DEFICIT_COMPACT budget restart"
+                    disable_budget_restart "${input_file}" "BUDGET_TIME_AVG_DEFICIT_COMPACT" || {
+                        mlog "[Budget][${file_label}] ERROR: Failed to disable DEFICIT_COMPACT budget restart"
+                        update_failed=1
+                    }
+                fi
+            else
+                # Find active budgets
+                local active_budgets=()
+                for i in 0 1 2 3; do
+                    local do_budget=$(parse_budget_value "${section}" "do_budget${i}")
+                    if [[ "${do_budget}" == ".true." || "${do_budget}" == ".TRUE." ]]; then
+                        active_budgets+=("${i}")
+                    fi
+                done
+                
+                if [[ "${#active_budgets[@]}" -eq 0 ]]; then
+                    if [[ "${mode}" == "discover" ]]; then
+                        mlog "[Budget][${file_label}] No active DEFICIT_COMPACT budgets"
+                    fi
+                    if [[ "${mode}" == "update" ]]; then
+                        disable_budget_restart "${input_file}" "BUDGET_TIME_AVG_DEFICIT_COMPACT" || {
+                            mlog "[Budget][${file_label}] ERROR: Failed to disable DEFICIT_COMPACT budget restart"
+                            update_failed=1
+                        }
+                    fi
+                else
+                    if [[ "${mode}" == "discover" ]]; then
+                        mlog "[Budget][${file_label}] Active DEFICIT_COMPACT budgets: ${active_budgets[*]}"
+                    fi
+                    
+                    # Get all valid states for each active budget
+                    local -a all_states
+                    local valid_budgets=0
+                    
+                    for budget_num in "${active_budgets[@]}"; do
+                        local states=$(find_all_deficit_compact_budget_states "${budget_dir}" "${rid_pad}" "${budget_num}" "${max_tidx}")
+                        
+                        if [[ -n "${states}" ]]; then
+                            all_states+=("${states}")
+                            valid_budgets=$((valid_budgets + 1))
+                            if [[ "${mode}" == "discover" ]]; then
+                                mlog "[Budget][${file_label}] Budget${budget_num}: found $(echo "${states}" | wc -l) valid state(s)"
+                            fi
+                        else
+                            if [[ "${mode}" == "discover" ]]; then
+                                mlog "[Budget][${file_label}] WARNING: No valid states for budget${budget_num}"
+                            fi
+                        fi
+                    done
+                    
+                    # Find common state across all active budgets
+                    if [[ "${valid_budgets}" -eq "${#active_budgets[@]}" ]]; then
+                        local common_state=$(find_common_budget_state all_states)
+                        
+                        if [[ -n "${common_state}" ]]; then
+                            local tidx="${common_state%%,*}"
+                            local counter="${common_state##*,}"
+                            
+                            mlog "[Budget][${file_label}] DEFICIT_COMPACT common state: TIDX=${tidx}, counter=${counter}"
+                            
+                            if [[ "${mode}" == "update" ]]; then
+                                update_budget_namelist "${input_file}" "BUDGET_TIME_AVG_DEFICIT_COMPACT" \
+                                    "${runid}" "${tidx}" "${counter}" || {
+                                    mlog "[Budget][${file_label}] ERROR: Failed to update DEFICIT_COMPACT budget restart"
+                                    update_failed=1
+                                }
+                            fi
+                            
+                            # Track minimum budget TIDX
+                            if [[ -z "${min_budget_tidx}" || "${tidx}" -lt "${min_budget_tidx}" ]]; then
+                                min_budget_tidx="${tidx}"
+                            fi
+                        else
+                            mlog "[Budget][${file_label}] WARNING: No common state found for DEFICIT_COMPACT budgets"
+                            if [[ "${mode}" == "update" ]]; then
+                                mlog "[Budget][${file_label}] Disabling DEFICIT_COMPACT budget restart"
+                                disable_budget_restart "${input_file}" "BUDGET_TIME_AVG_DEFICIT_COMPACT" || {
+                                    mlog "[Budget][${file_label}] ERROR: Failed to disable DEFICIT_COMPACT budget restart"
+                                    update_failed=1
+                                }
+                            fi
+                        fi
+                    else
+                        mlog "[Budget][${file_label}] WARNING: Not all DEFICIT_COMPACT budgets have valid states"
+                        if [[ "${mode}" == "update" ]]; then
+                            mlog "[Budget][${file_label}] Disabling DEFICIT_COMPACT budget restart"
+                            disable_budget_restart "${input_file}" "BUDGET_TIME_AVG_DEFICIT_COMPACT" || {
+                                mlog "[Budget][${file_label}] ERROR: Failed to disable DEFICIT_COMPACT budget restart"
+                                update_failed=1
+                            }
+                        fi
+                    fi
+                fi
+            fi
+        fi
+    fi
+    
+    # Process BUDGET_TIME_AVG
+    section=$(parse_namelist_section "${input_file}" "BUDGET_TIME_AVG")
+    if [[ -n "${section}" ]]; then
+        local do_budgets=$(parse_budget_value "${section}" "do_budgets")
+        
+        if [[ "${do_budgets}" == ".true." || "${do_budgets}" == ".TRUE." ]]; then
+            if [[ "${mode}" == "discover" ]]; then
+                mlog "[Budget][${file_label}] BUDGET_TIME_AVG is active"
+            fi
+            
+            local budget_type=$(parse_budget_value "${section}" "budgetType")
+            local squeeze=$(parse_budget_value "${section}" "squeeze")
+            local budget_dir_raw=$(parse_budget_value "${section}" "budgets_dir")
+            local budget_dir=$(resolve_budget_dir "${budget_dir_raw}")
+            
+            if [[ "${mode}" == "discover" ]]; then
+                mlog "[Budget][${file_label}] budgetType=${budget_type}, squeeze=${squeeze}"
+            fi
+            
+            if [[ ! -d "${budget_dir}" ]]; then
+                mlog "[Budget][${file_label}] WARNING: TIME_AVG budget directory not found: ${budget_dir}"
+                if [[ "${mode}" == "update" ]]; then
+                    mlog "[Budget][${file_label}] Disabling TIME_AVG budget restart"
+                    disable_budget_restart "${input_file}" "BUDGET_TIME_AVG" || {
+                        mlog "[Budget][${file_label}] ERROR: Failed to disable TIME_AVG budget restart"
+                        update_failed=1
+                    }
+                fi
+            elif [[ "${budget_type}" == "0" && ("${squeeze}" == ".true." || "${squeeze}" == ".TRUE.") ]]; then
+                local states=$(find_all_time_avg_budget_states "${budget_dir}" "${rid_pad}" "${budget_type}" "${max_tidx}")
+                
+                if [[ -n "${states}" ]]; then
+                    # Get latest state
+                    local latest_state=$(echo "${states}" | sort -t, -k1,1rn -k2,2rn | head -1)
+                    local tidx="${latest_state%%,*}"
+                    local counter="${latest_state##*,}"
+                    
+                    mlog "[Budget][${file_label}] TIME_AVG: TIDX=${tidx}, counter=${counter}"
+                    
+                    if [[ "${mode}" == "update" ]]; then
+                        update_budget_namelist "${input_file}" "BUDGET_TIME_AVG" \
+                            "${runid}" "${tidx}" "${counter}" || {
+                            mlog "[Budget][${file_label}] ERROR: Failed to update TIME_AVG budget restart"
+                            update_failed=1
+                        }
+                    fi
+                    
+                    # Track minimum budget TIDX
+                    if [[ -z "${min_budget_tidx}" || "${tidx}" -lt "${min_budget_tidx}" ]]; then
+                        min_budget_tidx="${tidx}"
+                    fi
+                else
+                    mlog "[Budget][${file_label}] WARNING: No valid TIME_AVG budget states found"
+                    if [[ "${mode}" == "update" ]]; then
+                        mlog "[Budget][${file_label}] Disabling TIME_AVG budget restart"
+                        disable_budget_restart "${input_file}" "BUDGET_TIME_AVG" || {
+                            mlog "[Budget][${file_label}] ERROR: Failed to disable TIME_AVG budget restart"
+                            update_failed=1
+                        }
+                    fi
+                fi
+            else
+                if [[ "${mode}" == "discover" ]]; then
+                    mlog "[Budget][${file_label}] Skipping TIME_AVG restart (unsupported budgetType or squeeze setting)"
+                fi
+                if [[ "${mode}" == "update" ]]; then
+                    disable_budget_restart "${input_file}" "BUDGET_TIME_AVG" || {
+                        mlog "[Budget][${file_label}] ERROR: Failed to disable TIME_AVG budget restart"
+                        update_failed=1
+                    }
+                fi
+            fi
+        fi
+    fi
+    
+    # Return appropriately based on mode
+    if [[ "${mode}" == "discover" ]]; then
+        # Return the minimum budget TIDX found (stdout is used as return channel)
+        echo "${min_budget_tidx}"
+        return 0
+    else
+        # Update mode: fail if any update operation failed
+        if [[ "${update_failed}" -ne 0 ]]; then
+            mlog "[Budget][${file_label}] Budget update FAILED - aborting restart sequence"
+            return 1
+        fi
+        return 0
+    fi
+}
+
 _update_input_files() {
-    local tid="$1"
+    local common_restart_tid="$1"
 
     mlog "[Update] Ensuring original input backups exist (suffix: .bak_job${SLURM_JOB_ID})"
 
@@ -834,19 +1327,69 @@ _update_input_files() {
     [[ -f "${PRECURSOR_INPUTFILE}.bak_job${SLURM_JOB_ID}" ]] || \
         cp "${PRECURSOR_INPUTFILE}" "${PRECURSOR_INPUTFILE}.bak_job${SLURM_JOB_ID}" || return 1
 
-    mlog "[Update] Writing restart settings — common TID=${tid}"
+    mlog "================================================================"
+    mlog "[Update] Phase 1: Finding restart constraints from all systems..."
+    mlog "================================================================"
+    mlog "[Update] Restart files: common TID=${common_restart_tid}"
+    
+    # PHASE 1: Discover budget constraints (but don't update files yet)
+    local primary_min_budget=$(process_budget_restarts_for_file \
+        "${PRIMARY_INPUTFILE}" "PRIMARY" "${PRIMARY_RUNID}" "${PRIMARY_RID_PAD}" "${common_restart_tid}" "discover")
+    
+    local precursor_min_budget=$(process_budget_restarts_for_file \
+        "${PRECURSOR_INPUTFILE}" "PRECURSOR" "${PRECURSOR_RUNID}" "${PRECURSOR_RID_PAD}" "${common_restart_tid}" "discover")
+    
+    # Compute absolute minimum across restart files and all budgets
+    local final_restart_tid="${common_restart_tid}"
+    
+    if [[ -n "${primary_min_budget}" && "${primary_min_budget}" -lt "${final_restart_tid}" ]]; then
+        mlog "[Update] PRIMARY budgets constrain restart to TIDX=${primary_min_budget}"
+        final_restart_tid="${primary_min_budget}"
+    fi
+    
+    if [[ -n "${precursor_min_budget}" && "${precursor_min_budget}" -lt "${final_restart_tid}" ]]; then
+        mlog "[Update] PRECURSOR budgets constrain restart to TIDX=${precursor_min_budget}"
+        final_restart_tid="${precursor_min_budget}"
+    fi
+    
+    mlog "================================================================"
+    mlog "[Update] Final common restart point: TIDX=${final_restart_tid}"
+    mlog "================================================================"
+    
+    # PHASE 2: Update restart files with final common TIDX
+    mlog "[Update] Phase 2: Writing restart file settings..."
     set_namelist_value "${PRIMARY_INPUTFILE}"   "useRestartFile"   ".true."             || return 1
-    set_namelist_value "${PRIMARY_INPUTFILE}"   "restartFile_TID"  "${tid}"             || return 1
+    set_namelist_value "${PRIMARY_INPUTFILE}"   "restartFile_TID"  "${final_restart_tid}"             || return 1
     set_namelist_value "${PRIMARY_INPUTFILE}"   "restartFile_RID"  "${PRIMARY_RUNID}"   || return 1
 
     set_namelist_value "${PRECURSOR_INPUTFILE}" "useRestartFile"   ".true."             || return 1
-    set_namelist_value "${PRECURSOR_INPUTFILE}" "restartFile_TID"  "${tid}"             || return 1
+    set_namelist_value "${PRECURSOR_INPUTFILE}" "restartFile_TID"  "${final_restart_tid}"             || return 1
     set_namelist_value "${PRECURSOR_INPUTFILE}" "restartFile_RID"  "${PRECURSOR_RUNID}" || return 1
 
     mlog "[Update] PRIMARY   — verified restart fields:"
     grep -iE 'useRestartFile|restartFile_TID|restartFile_RID' "${PRIMARY_INPUTFILE}" >> "${MONITOR_LOG}"
     mlog "[Update] PRECURSOR — verified restart fields:"
     grep -iE 'useRestartFile|restartFile_TID|restartFile_RID' "${PRECURSOR_INPUTFILE}" >> "${MONITOR_LOG}"
+    
+    # PHASE 3: Re-process budgets with final restart TID to ensure consistency
+    mlog "================================================================"
+    mlog "[Update] Phase 3: Writing budget restart settings (using final TIDX=${final_restart_tid})..."
+    mlog "================================================================"
+    
+    # These must succeed or restart sequence aborts
+    process_budget_restarts_for_file \
+        "${PRIMARY_INPUTFILE}" "PRIMARY" "${PRIMARY_RUNID}" "${PRIMARY_RID_PAD}" "${final_restart_tid}" "update" >/dev/null || {
+        mlog "[Update] CRITICAL ERROR: PRIMARY budget update failed - aborting restart"
+        return 1
+    }
+    
+    process_budget_restarts_for_file \
+        "${PRECURSOR_INPUTFILE}" "PRECURSOR" "${PRECURSOR_RUNID}" "${PRECURSOR_RID_PAD}" "${final_restart_tid}" "update" >/dev/null || {
+        mlog "[Update] CRITICAL ERROR: PRECURSOR budget update failed - aborting restart"
+        return 1
+    }
+    
+    mlog "[Update] All restart configurations complete and synchronized."
 }
 
 _restore_input_files() {
