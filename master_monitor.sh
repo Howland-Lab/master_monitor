@@ -468,16 +468,24 @@ SSTAT_MAXVM_KB=0
 SSTAT_AVEVM_KB=0
 
 sample_memory_sstat() {
-    local ts epoch data
+    local ts epoch data target
     local peak_maxrss=0 peak_averss=0 peak_maxvm=0 peak_avevm=0
     local got_data=0
 
     ts=$(date '+%F %T')
     epoch=$(date +%s)
+    data=""
 
-    data=$(sstat -j "${SLURM_JOB_ID}" \
-        --format=JobID,MaxRSS,AveRSS,MaxVMSize,AveVMSize \
-        --noheader 2>/dev/null || true)
+    # First try the bare job ID (works on some clusters, e.g. Anvil),
+    # then fall back to the batch step (needed on some others, e.g. Stampede3).
+    for target in "${SLURM_JOB_ID}" "${SLURM_JOB_ID}.batch"; do
+        data=$(sstat -j "${target}" \
+            --format=JobID,MaxRSS,AveRSS,MaxVMSize,AveVMSize \
+            --noheader 2>/dev/null || true)
+        if [[ -n "${data}" ]] && echo "${data}" | grep -q '[^[:space:]]'; then
+            break
+        fi
+    done
 
     if [[ -z "${data}" ]] || ! echo "${data}" | grep -q '[^[:space:]]'; then
         SSTAT_MAXRSS_KB=0
@@ -490,28 +498,43 @@ sample_memory_sstat() {
     while IFS= read -r line; do
         [[ -z "${line// /}" ]] && continue
 
-        local step maxrss averss maxvm avevm
-        read -r step maxrss averss maxvm avevm \
-            <<< "$(echo "${line}" | awk '{$1=$1; print $1, $2, $3, $4, $5}')"
+        # Guard against stale/buggy SLURM versions that emit a header despite --noheader.
+        [[ "${line}" =~ ^[[:space:]]*JobID ]] && continue
 
-        maxrss=$(echo "${maxrss}" | sed 's/K$//; s/+*$//')
-        averss=$(echo "${averss}" | sed 's/K$//; s/+*$//')
-        maxvm=$(echo "${maxvm}"   | sed 's/K$//; s/+*$//')
-        avevm=$(echo "${avevm}"   | sed 's/K$//; s/+*$//')
+        local step maxrss averss maxvm avevm
+        # Assign before read so fields are never stale on a partial read.
+        step="" maxrss="" averss="" maxvm="" avevm=""
+        read -r step maxrss averss maxvm avevm <<< "${line}"
+
+        # Skip malformed rows.
+        [[ -z "${step}" ]] && continue
+        if [[ -z "${maxrss}" && -z "${averss}" && -z "${maxvm}" && -z "${avevm}" ]]; then
+            continue
+        fi
+
+        # Strip only Slurm's trailing "+" continuation marker.
+        # Keep units intact for parse_size_to_kb().
+        maxrss="${maxrss%%+}"
+        averss="${averss%%+}"
+        maxvm="${maxvm%%+}"
+        avevm="${avevm%%+}"
 
         local mrss arss mvm avm
         mrss=$(parse_size_to_kb "${maxrss}"); [[ "${mrss}" =~ ^[0-9]+$ ]] || mrss=0
         arss=$(parse_size_to_kb "${averss}"); [[ "${arss}" =~ ^[0-9]+$ ]] || arss=0
-        mvm=$(parse_size_to_kb  "${maxvm}");  [[ "${mvm}"  =~ ^[0-9]+$ ]] || mvm=0
-        avm=$(parse_size_to_kb  "${avevm}");  [[ "${avm}"  =~ ^[0-9]+$ ]] || avm=0
+        mvm=$(parse_size_to_kb "${maxvm}");  [[ "${mvm}"  =~ ^[0-9]+$ ]] || mvm=0
+        avm=$(parse_size_to_kb "${avevm}");  [[ "${avm}"  =~ ^[0-9]+$ ]] || avm=0
 
-        # Append this step row to CSV
-        echo "${ts},${epoch},${SLURM_JOB_ID},${step},${mrss},${arss},${mvm},${avm}" >> "${MEM_CSV}"
+        # Append this step row to CSV.
+        echo "${ts},${epoch},${SLURM_JOB_ID},${step},${mrss},${arss},${mvm},${avm}" \
+            >> "${MEM_CSV}" \
+            || { echo "WARNING: sample_memory_sstat: failed to write to ${MEM_CSV}" >&2; return 1; }
 
         [[ "${mrss}" -gt "${peak_maxrss}" ]] && peak_maxrss="${mrss}"
         [[ "${arss}" -gt "${peak_averss}" ]] && peak_averss="${arss}"
         [[ "${mvm}"  -gt "${peak_maxvm}"  ]] && peak_maxvm="${mvm}"
         [[ "${avm}"  -gt "${peak_avevm}"  ]] && peak_avevm="${avm}"
+
         got_data=1
     done <<< "${data}"
 
@@ -520,6 +543,7 @@ sample_memory_sstat() {
     SSTAT_MAXVM_KB="${peak_maxvm}"
     SSTAT_AVEVM_KB="${peak_avevm}"
 
+    # Return 0 iff at least one valid data row was parsed.
     [[ "${got_data}" -eq 1 ]]
 }
 
