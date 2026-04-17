@@ -563,9 +563,9 @@ submit_from_config() {
     local dependency_mode="${1:-none}"
     local dependency_jobid="${2:-}"
     if [[ "${dependency_mode}" == "afterany" ]]; then
-        sbatch --dependency="afterany:${dependency_jobid}" "${THIS_SCRIPT}"
+        sbatch --parsable --dependency="afterany:${dependency_jobid}" "${THIS_SCRIPT}"
     else
-        sbatch "${THIS_SCRIPT}"
+        sbatch --parsable "${THIS_SCRIPT}"
     fi
 }
 
@@ -601,14 +601,13 @@ submit_with_retry() {
 
 stage_restart_handoff_and_exit() {
     local reason="$1"
-    local restart_tidx="$2"
 
     mlog "[Handoff] Self-submission unavailable or failed."
     mlog "[Handoff] Reason: ${reason}"
-    mlog "[Handoff] Staged restart TIDX=${restart_tidx} for downstream dependent job."
+    mlog "[Handoff] Restart inputs already prepared. Signaling downstream dependent job."
 
-    printf 'jobid=%s\nrestart_tidx=%s\nreason=%s\ntime=%s\n' \
-        "${SLURM_JOB_ID}" "${restart_tidx}" "${reason}" "$(date '+%F %T')" \
+    printf 'jobid=%s\nreason=%s\ntime=%s\n' \
+        "${SLURM_JOB_ID}" "${reason}" "$(date '+%F %T')" \
         > "${RESTART_READY_FILE}"
 
     sync || true
@@ -1846,7 +1845,6 @@ while kill -0 "${MPI_PID}" 2>/dev/null; do
         if ! acquire_restart_lock; then
             trap 'emergency_resubmit TERM' TERM
             mlog "[Monitor] Restart lock already held. Another path is handling restart."
-            CHILD_SUBMITTED=1
             continue
         fi
         trap 'emergency_resubmit TERM' TERM
@@ -1886,7 +1884,7 @@ while kill -0 "${MPI_PID}" 2>/dev/null; do
         if [[ -z "${CHILD_JOB_ID}" || ! "${CHILD_JOB_ID}" =~ ^[0-9]+$ ]]; then
             mlog "[Monitor] sbatch failed after retries (compute-node submission blocked?)."
             mlog "[Monitor] Input files are already prepared. Falling back to staged handoff."
-            stage_restart_handoff_and_exit "sbatch_unavailable_from_compute_node" "${COMMON_TID}"
+            stage_restart_handoff_and_exit "sbatch_unavailable_from_compute_node"
             # Does not return — stage_restart_handoff_and_exit kills MPI and exits
         fi
 
