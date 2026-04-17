@@ -130,6 +130,9 @@ MEM_CSV="${CONFIG_DIR}/memdiag_job${SLURM_JOB_ID}.csv"
 # Monitoring log file
 MONITOR_LOG="${CONFIG_DIR}/monitor.log.${SLURM_JOB_ID}"
 
+RESTART_READY_FILE="${CONFIG_DIR}/.restart_ready"
+SIM_DONE_FILE="${CONFIG_DIR}/.sim_done"
+
 HARD_CUTOFF_SECONDS="${HARD_CUTOFF_SECONDS:-600}"
 SAFETY_FACTOR="${SAFETY_FACTOR:-1.2}"
 MONITOR_INTERVAL="${MONITOR_INTERVAL:-60}"
@@ -569,25 +572,56 @@ submit_from_config() {
 submit_with_retry() {
     local dependency_mode="${1:-none}"
     local dependency_jobid="${2:-}"
-    local max_retries="${3:-3}"
+    local max_attempts="${3:-3}"
     local sleep_seconds="${4:-10}"
-    local attempt=1 out child_id
 
-    while [[ "${attempt}" -le "${max_retries}" ]]; do
-        out="$(submit_from_config "${dependency_mode}" "${dependency_jobid}" 2>&1 || true)"
-        child_id="$(echo "${out}" | awk '{print $NF}')"
-        if [[ "${child_id}" =~ ^[0-9]+$ ]]; then
-            echo "${child_id}"
+    local attempt=1
+    local out rc
+
+    while [[ "${attempt}" -le "${max_attempts}" ]]; do
+        out="$(submit_from_config "${dependency_mode}" "${dependency_jobid}" 2>&1)"
+        rc=$?
+
+        if [[ "${rc}" -eq 0 ]]; then
+            echo "${out}"
             return 0
         fi
-        mlog "[Submit] Attempt ${attempt}/${max_retries} failed."
+
+        mlog "[Submit] Attempt ${attempt}/${max_attempts} failed."
         mlog "[Submit] sbatch output: ${out}"
-        if [[ "${attempt}" -lt "${max_retries}" ]]; then
+
+        if [[ "${attempt}" -lt "${max_attempts}" ]]; then
             sleep "${sleep_seconds}"
         fi
         attempt=$(( attempt + 1 ))
     done
+
     return 1
+}
+
+stage_restart_handoff_and_exit() {
+    local reason="$1"
+    local restart_tidx="$2"
+
+    mlog "[Handoff] Self-submission unavailable or failed."
+    mlog "[Handoff] Reason: ${reason}"
+    mlog "[Handoff] Staged restart TIDX=${restart_tidx} for downstream dependent job."
+
+    printf 'jobid=%s\nrestart_tidx=%s\nreason=%s\ntime=%s\n' \
+        "${SLURM_JOB_ID}" "${restart_tidx}" "${reason}" "$(date '+%F %T')" \
+        > "${RESTART_READY_FILE}"
+
+    sync || true
+
+    if [[ -n "${MPI_PID:-}" ]] && kill -0 "${MPI_PID}" 2>/dev/null; then
+        mlog "[Handoff] Terminating MPI PID ${MPI_PID}."
+        kill -TERM "${MPI_PID}" 2>/dev/null || true
+        wait "${MPI_PID}" 2>/dev/null || true
+    fi
+
+    release_restart_lock
+    mlog "[Handoff] Exiting current job to allow dependent child to continue."
+    exit 0
 }
 
 parse_namelist_value() {
@@ -920,8 +954,8 @@ find_all_deficit_compact_budget_states() {
     while IFS= read -r tidx; do
         local tidx_num=$((10#${tidx}))
         
-        # Safety: must be strictly less than latest simulation TIDX
-        [[ "${tidx_num}" -ge "${max_tidx}" ]] && continue
+        # Safety: must be less than or equal to the latest simulation TIDX
+        [[ "${tidx_num}" -gt "${max_tidx}" ]] && continue
         
         # Count files for this TIDX
         local file_count=$(find "${budget_dir}" -maxdepth 1 \
@@ -961,7 +995,7 @@ find_all_time_avg_budget_states() {
         while IFS= read -r tidx; do
             local tidx_num=$((10#${tidx}))
             
-            [[ "${tidx_num}" -ge "${max_tidx}" ]] && continue
+            [[ "${tidx_num}" -gt "${max_tidx}" ]] && continue
             
             local all_present=1
             for term in ${required_terms}; do
@@ -1431,57 +1465,91 @@ CHILD_SUBMITTED=0
 CHILD_JOB_ID=""
 
 emergency_resubmit() {
-    mlog "================================================================"
-    mlog "[Trap] Caught SIGTERM."
-    mlog "================================================================"
+    local reason="${1:-SIGTERM}"
+    local child_id submit_rc
+    local emerg_tid=""
 
-    if [[ "${CHILD_SUBMITTED}" -eq 1 ]]; then
-        mlog "[Trap] Child already queued (ID=${CHILD_JOB_ID}). Nothing to do."
-        return
-    fi
-
+    # Do not let multiple trigger paths run restart logic simultaneously
     if ! acquire_restart_lock; then
-        mlog "[Trap] Restart lock already held by another path. Nothing to do."
-        return
+        mlog "[Emergency] Restart lock already held. Another restart path is active. Exiting handler."
+        return 0
     fi
 
-    local common_tid_raw common_tid
-    common_tid_raw=$(latest_common_restart_tid \
+    mlog "[Emergency] Triggered by ${reason}."
+    mlog "[Emergency] Locating latest common restart TID..."
+
+    emerg_tid="$(latest_common_restart_tid \
         "${PRIMARY_INPUTDIR}"   "${PRIMARY_RID_PAD}" \
-        "${PRECURSOR_INPUTDIR}" "${PRECURSOR_RID_PAD}")
+        "${PRECURSOR_INPUTDIR}" "${PRECURSOR_RID_PAD}" || true)"
 
-    if [[ -z "${common_tid_raw}" ]]; then
-        mlog "[Trap] ERROR: No common restart TID found. Cannot resubmit safely."
+    if [[ -z "${emerg_tid}" || ! "${emerg_tid}" =~ ^[0-9]+$ ]]; then
+        mlog "[Emergency] ERROR: No valid common restart TID found."
+        mlog "[Emergency] Cannot prepare restart inputs safely."
+
+        # Best effort shutdown of MPI before exiting
+        if [[ -n "${MPI_PID:-}" ]] && kill -0 "${MPI_PID}" 2>/dev/null; then
+            mlog "[Emergency] Terminating MPI PID ${MPI_PID}."
+            kill -TERM "${MPI_PID}" 2>/dev/null || true
+            wait "${MPI_PID}" 2>/dev/null || true
+        fi
+
         release_restart_lock
-        return
+        exit 1
     fi
 
-    common_tid=$(( 10#${common_tid_raw} ))
-    mlog "[Trap] Common restart TID: ${common_tid}"
+    mlog "[Emergency] Common restart TID: ${emerg_tid}"
+    mlog "[Emergency] Preparing input files for restart..."
 
-    _update_input_files "${common_tid}" || {
-        mlog "[Trap] ERROR: Input file update failed. Aborting emergency resubmit."
-        release_restart_lock
-        return
-    }
+    if ! _update_input_files "${emerg_tid}"; then
+        mlog "[Emergency] ERROR: _update_input_files failed for TID ${emerg_tid}."
+        mlog "[Emergency] Any downstream job could start from stale inputs. Aborting emergency handoff."
 
-    local child_id
-    child_id="$(submit_with_retry none "" 3 10 || true)"
-    if [[ "${child_id}" =~ ^[0-9]+$ ]]; then
-        mlog "[Trap] Emergency child submitted: ID=${child_id}"
-        CHILD_SUBMITTED=1
-        CHILD_JOB_ID="${child_id}"
-    else
-        mlog "[Trap] ERROR: Emergency sbatch failed after retries. Manual restart required."
+        if [[ -n "${MPI_PID:-}" ]] && kill -0 "${MPI_PID}" 2>/dev/null; then
+            mlog "[Emergency] Terminating MPI PID ${MPI_PID}."
+            kill -TERM "${MPI_PID}" 2>/dev/null || true
+            wait "${MPI_PID}" 2>/dev/null || true
+        fi
+
         release_restart_lock
-        return
+        exit 1
     fi
+
+    mlog "[Emergency] Input files prepared successfully."
+    mlog "[Emergency] Attempting child submission..."
+
+    child_id="$(submit_with_retry none "" 3 10)"
+    submit_rc=$?
+
+    if [[ "${submit_rc}" -eq 0 && -n "${child_id}" && "${child_id}" =~ ^[0-9]+$ ]]; then
+        mlog "[Emergency] Child submitted successfully: ${child_id}"
+
+        if [[ -n "${MPI_PID:-}" ]] && kill -0 "${MPI_PID}" 2>/dev/null; then
+            mlog "[Emergency] Terminating MPI PID ${MPI_PID}."
+            kill -TERM "${MPI_PID}" 2>/dev/null || true
+            wait "${MPI_PID}" 2>/dev/null || true
+        fi
+
+        release_restart_lock
+        exit 0
+    fi
+
+    mlog "[Emergency] Child submission failed after 3 attempts."
+    mlog "[Emergency] Falling back to staged handoff."
+
+    printf 'jobid=%s\nreason=%s\ntime=%s\n' \
+        "${SLURM_JOB_ID}" "${reason}" "$(date '+%F %T')" \
+        > "${RESTART_READY_FILE}"
+    sync || true
 
     if [[ -n "${MPI_PID:-}" ]] && kill -0 "${MPI_PID}" 2>/dev/null; then
-        mlog "[Trap] Terminating MPI launcher (PID=${MPI_PID}) after emergency resubmit."
-        kill "${MPI_PID}" 2>/dev/null || true
+        mlog "[Emergency] Terminating MPI PID ${MPI_PID}."
+        kill -TERM "${MPI_PID}" 2>/dev/null || true
         wait "${MPI_PID}" 2>/dev/null || true
     fi
+
+    release_restart_lock
+    mlog "[Emergency] Exiting current job after staged handoff."
+    exit 0
 }
 
 trap emergency_resubmit TERM
@@ -1493,6 +1561,16 @@ trap cleanup_watchers EXIT
 
 # Write CSV header
 echo "timestamp,epoch,jobid,step,maxrss(KB),averss(KB),maxvmsize(KB),avevmsize(KB)" > "${MEM_CSV}"
+
+if [[ -f "${SIM_DONE_FILE}" ]]; then
+    mlog "SIM_DONE marker found. Exiting without launching MPI."
+    exit 0
+fi
+
+if [[ -f "${RESTART_READY_FILE}" ]]; then
+    mlog "RESTART_READY marker found. Continuing with staged restart inputs."
+    rm -f "${RESTART_READY_FILE}"
+fi
 
 mlog "Launching MPI simulation..."
 run_job
@@ -1764,11 +1842,21 @@ while kill -0 "${MPI_PID}" 2>/dev/null; do
         mlog "[Monitor] Restart trigger: ${TRIGGER_REASON}"
         mlog "================================================================"
 
+        trap '' TERM
         if ! acquire_restart_lock; then
-            mlog "[Monitor] Restart lock already held by another path. Skipping duplicate action."
+            trap 'emergency_resubmit TERM' TERM
+            mlog "[Monitor] Restart lock already held. Another path is handling restart."
             CHILD_SUBMITTED=1
             continue
         fi
+        trap 'emergency_resubmit TERM' TERM
+
+        # from here onward, this monitor path owns the restart sequence
+        # compute COMMON_TID
+        # update input files
+        # try submit_with_retry
+        # on failure -> stage_restart_handoff_and_exit
+        # on success  -> terminate MPI and exit
 
         COMMON_TID_RAW=$(latest_common_restart_tid \
             "${PRIMARY_INPUTDIR}"   "${PRIMARY_RID_PAD}" \
@@ -1796,11 +1884,10 @@ while kill -0 "${MPI_PID}" 2>/dev/null; do
         CHILD_JOB_ID="$(submit_with_retry afterany "${SLURM_JOB_ID}" 3 10 || true)"
 
         if [[ -z "${CHILD_JOB_ID}" || ! "${CHILD_JOB_ID}" =~ ^[0-9]+$ ]]; then
-            mlog "[Monitor] ERROR: sbatch failed after retries. Restoring input files."
-            _restore_input_files
-            mlog "[Monitor] Will retry next cycle."
-            release_restart_lock
-            continue
+            mlog "[Monitor] sbatch failed after retries (compute-node submission blocked?)."
+            mlog "[Monitor] Input files are already prepared. Falling back to staged handoff."
+            stage_restart_handoff_and_exit "sbatch_unavailable_from_compute_node" "${COMMON_TID}"
+            # Does not return — stage_restart_handoff_and_exit kills MPI and exits
         fi
 
         mlog "[Monitor] Child job queued: ID=${CHILD_JOB_ID} (depends on ${SLURM_JOB_ID})"
