@@ -1583,8 +1583,6 @@ JOB_START_EPOCH=$(date +%s)
 
 mlog "MPI PID         : ${MPI_PID}"
 mlog "Clock started."
-mlog "Memory CSV      : ${MEM_CSV}"
-mlog "Monitor log     : ${MONITOR_LOG}"
 
 # Initial settling period
 if [[ "${MONITOR_SETTLE_TIME}" -gt 0 ]]; then
