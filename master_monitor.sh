@@ -169,6 +169,15 @@ MEMORY_RATE_WINDOW="${MEMORY_RATE_WINDOW:-4}"
 # average over this many previous steps.
 ELAPSED_STEP_WINDOW="${ELAPSED_STEP_WINDOW:-5}"
 
+# Stack-dump diagnostics for frozen/no-progress jobs
+STACK_DUMP_ENABLED="${STACK_DUMP_ENABLED:-1}"
+STACK_DUMP_TIME_LIMIT="${STACK_DUMP_TIME_LIMIT:-00:10:00}"
+STACK_DUMP_GDB_TIMEOUT_SECONDS="${STACK_DUMP_GDB_TIMEOUT_SECONDS:-60}"
+
+# Export so the worker launched by srun can see the requested per-process gdb timeout.
+# If a site strips the srun environment, the worker still falls back to 60 seconds.
+export STACK_DUMP_GDB_TIMEOUT_SECONDS
+
 # Parse wall-time from local case file
 WALL_TIME_STR=$(
     awk '
@@ -211,6 +220,345 @@ fi
 # mlog: print a timestamped message to monitor log file
 mlog() {
     printf '[%s] %s\n' "$(date '+%F %T')" "$*" >> "${MONITOR_LOG}"
+}
+
+# ==============================================================================
+#  MPI STACK DUMP DIAGNOSTIC
+#
+#  Best-effort diagnostic used when the monitor detects a frozen/no-progress job.
+#  It launches one diagnostic shell per allocated node and uses gdb to dump the
+#  stack of each matching solver process owned by $USER.
+#
+#  Inputs are inferred from the monitor state:
+#      SLURM_JOB_ID   : current Slurm job
+#      solver         : full solver path; basename is used as pgrep pattern
+#      CONFIG_DIR     : stack dump directory is created here
+#      CONFIG_ABS     : local case script, used as fallback for #SBATCH parsing
+#      mlog()         : monitor logging stream
+# ==============================================================================
+
+_parse_sbatch_directive_from_config() {
+    local key="$1"
+    local file="${2:-${CONFIG_ABS}}"
+
+    [[ -f "${file}" ]] || return 1
+
+    case "${key}" in
+        nodes)
+            awk '
+                /^#SBATCH[[:space:]]+-N[[:space:]]+/              { print $3; exit }
+                /^#SBATCH[[:space:]]+--nodes=/                    { sub(/^#SBATCH[[:space:]]+--nodes=/,""); print; exit }
+                /^#SBATCH[[:space:]]+--nodes[[:space:]]+/         { print $3; exit }
+            ' "${file}"
+            ;;
+        partition)
+            awk '
+                /^#SBATCH[[:space:]]+-p[[:space:]]+/              { print $3; exit }
+                /^#SBATCH[[:space:]]+--partition=/                { sub(/^#SBATCH[[:space:]]+--partition=/,""); print; exit }
+                /^#SBATCH[[:space:]]+--partition[[:space:]]+/     { print $3; exit }
+            ' "${file}"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+_get_stackdump_nnodes() {
+    local nnodes=""
+
+    # Prefer live Slurm allocation.
+    nnodes="$(scontrol show job -o "${SLURM_JOB_ID}" 2>/dev/null \
+        | tr ' ' '\n' \
+        | awk -F= '$1=="NumNodes"{print $2; exit}' || true)"
+
+    # Fall back to environment.
+    if [[ -z "${nnodes}" || ! "${nnodes}" =~ ^[0-9]+$ ]]; then
+        nnodes="${SLURM_NNODES:-}"
+    fi
+
+    # Fall back to #SBATCH directives in the case script.
+    if [[ -z "${nnodes}" || ! "${nnodes}" =~ ^[0-9]+$ ]]; then
+        nnodes="$(_parse_sbatch_directive_from_config nodes || true)"
+    fi
+
+    [[ "${nnodes}" =~ ^[0-9]+$ ]] || return 1
+    echo "${nnodes}"
+}
+
+_get_stackdump_partition() {
+    local partition=""
+
+    # Prefer live Slurm allocation.
+    partition="$(scontrol show job -o "${SLURM_JOB_ID}" 2>/dev/null \
+        | tr ' ' '\n' \
+        | awk -F= '$1=="Partition"{print $2; exit}' || true)"
+
+    # Fall back to environment.
+    if [[ -z "${partition}" || "${partition}" == "(null)" ]]; then
+        partition="${SLURM_JOB_PARTITION:-}"
+    fi
+
+    # Fall back to #SBATCH directives in the case script.
+    if [[ -z "${partition}" || "${partition}" == "(null)" ]]; then
+        partition="$(_parse_sbatch_directive_from_config partition || true)"
+    fi
+
+    [[ -n "${partition}" && "${partition}" != "(null)" ]] || return 1
+    echo "${partition}"
+}
+
+dump_mpi_stacks_for_frozen_job() {
+    local reason="${1:-unknown}"
+    local solver_pattern
+    local timestamp outdir worker nodes_file
+    local nodelist_raw nnodes partition srun_rc
+    local class_summary counts_file
+
+    if [[ "${STACK_DUMP_ENABLED}" != "1" ]]; then
+        mlog "[StackDump] Disabled by STACK_DUMP_ENABLED=${STACK_DUMP_ENABLED}."
+        return 0
+    fi
+
+    if [[ -z "${SLURM_JOB_ID:-}" ]]; then
+        mlog "[StackDump] ERROR: SLURM_JOB_ID is empty; cannot dump MPI stacks."
+        return 1
+    fi
+
+    if [[ -z "${solver:-}" ]]; then
+        mlog "[StackDump] ERROR: solver is empty; cannot infer solver pattern."
+        return 1
+    fi
+
+    solver_pattern="$(basename "${solver}")"
+
+    if [[ -z "${solver_pattern}" || "${solver_pattern}" == "." || "${solver_pattern}" == "/" ]]; then
+        mlog "[StackDump] ERROR: invalid solver pattern inferred from solver='${solver}'."
+        return 1
+    fi
+
+    timestamp="$(date +%Y%m%d_%H%M%S)"
+    outdir="${CONFIG_DIR}/stackdump_job${SLURM_JOB_ID}_${timestamp}"
+    nodes_file="${outdir}/nodes.txt"
+    worker="${outdir}/worker_dump_stacks.sh"
+
+    mkdir -p "${outdir}" || {
+        mlog "[StackDump] ERROR: failed to create output directory: ${outdir}"
+        return 1
+    }
+
+    mlog "================================================================"
+    mlog "[StackDump] Starting MPI stack dump."
+    mlog "[StackDump] Trigger reason : ${reason}"
+    mlog "[StackDump] Job ID         : ${SLURM_JOB_ID}"
+    mlog "[StackDump] Solver path    : ${solver}"
+    mlog "[StackDump] Solver pattern : ${solver_pattern}"
+    mlog "[StackDump] Output dir     : ${outdir}"
+
+    nodelist_raw="$(get_job_nodelist || true)"
+    if [[ -z "${nodelist_raw}" ]]; then
+        nodelist_raw="$(squeue -j "${SLURM_JOB_ID}" -h -o "%N" 2>/dev/null || true)"
+    fi
+
+    if [[ -z "${nodelist_raw}" ]]; then
+        mlog "[StackDump] ERROR: could not determine node list for job ${SLURM_JOB_ID}."
+        return 1
+    fi
+
+    if ! scontrol show hostnames "${nodelist_raw}" > "${nodes_file}" 2>"${outdir}/scontrol_hostnames.err"; then
+        mlog "[StackDump] ERROR: scontrol show hostnames failed. See ${outdir}/scontrol_hostnames.err"
+        return 1
+    fi
+
+    nnodes="$(_get_stackdump_nnodes || true)"
+    if [[ -z "${nnodes}" || ! "${nnodes}" =~ ^[0-9]+$ ]]; then
+        nnodes="$(wc -l < "${nodes_file}" | tr -d ' ')"
+    fi
+
+    partition="$(_get_stackdump_partition || true)"
+    if [[ -z "${partition}" ]]; then
+        mlog "[StackDump] ERROR: could not determine partition for job ${SLURM_JOB_ID}."
+        return 1
+    fi
+
+    mlog "[StackDump] NodeList       : ${nodelist_raw}"
+    mlog "[StackDump] Nodes          : ${nnodes}"
+    mlog "[StackDump] Partition      : ${partition}"
+    mlog "[StackDump] Time limit     : ${STACK_DUMP_TIME_LIMIT}"
+
+    cat > "${worker}" <<'EOF'
+#!/usr/bin/env bash
+set -u
+
+SOLVER_PATTERN="$1"
+REMOTE_OUTDIR="$2"
+
+host="$(hostname -f 2>/dev/null || hostname)"
+short_host="$(hostname)"
+
+mkdir -p "${REMOTE_OUTDIR}"
+
+node_summary="${REMOTE_OUTDIR}/summary_${short_host}.txt"
+: > "${node_summary}"
+
+{
+    echo "===== NODE ${host} ====="
+    echo "Time: $(date)"
+    echo "Solver pattern: ${SOLVER_PATTERN}"
+} | tee -a "${node_summary}"
+
+if ! command -v gdb >/dev/null 2>&1; then
+    echo "ERROR: gdb not found on ${host}" | tee -a "${node_summary}"
+    exit 0
+fi
+
+ptrace_scope="$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo unknown)"
+echo "ptrace_scope: ${ptrace_scope}" | tee -a "${node_summary}"
+
+if [[ "${ptrace_scope}" =~ ^[0-9]+$ && "${ptrace_scope}" -ge 2 ]]; then
+    echo "WARNING: ptrace_scope=${ptrace_scope}; gdb attach may be blocked on this node." \
+        | tee -a "${node_summary}"
+fi
+
+run_user="$(id -un 2>/dev/null || echo "${USER:-}")"
+
+if [[ -z "${run_user}" ]]; then
+    echo "ERROR: could not determine run user on ${host}" | tee -a "${node_summary}"
+    exit 0
+fi
+
+mapfile -t pids < <(
+    pgrep -u "${run_user}" -f "${SOLVER_PATTERN}" 2>/dev/null \
+    | while read -r pid; do
+        [[ -n "${pid}" ]] || continue
+
+        cmd="$(ps -p "${pid}" -o cmd= 2>/dev/null || true)"
+
+        case "${cmd}" in
+            *grep*|*bash*|*dump_mpi_stacks*|*worker_dump_stacks*|*srun*|*ibrun*|*mpirun*|*mpiexec*|*hydra_pmi_proxy*)
+                ;;
+            *)
+                echo "${pid}"
+                ;;
+        esac
+    done
+)
+
+echo "Found ${#pids[@]} matching PID(s)." | tee -a "${node_summary}"
+
+if [[ "${#pids[@]}" -eq 0 ]]; then
+    ps -u "${run_user}" -o pid,ppid,stat,pcpu,pmem,cmd --sort=-pcpu \
+        > "${REMOTE_OUTDIR}/ps_${short_host}.txt" 2>&1
+    echo "No solver PIDs found. Wrote process snapshot." | tee -a "${node_summary}"
+    exit 0
+fi
+
+for pid in "${pids[@]}"; do
+    stackfile="${REMOTE_OUTDIR}/stack_${short_host}_${pid}.txt"
+    classfile="${REMOTE_OUTDIR}/class_${short_host}_${pid}.txt"
+
+    echo "Dumping PID ${pid} on ${short_host}" | tee -a "${node_summary}"
+
+    gdb_timeout="${STACK_DUMP_GDB_TIMEOUT_SECONDS:-60}"
+
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "${gdb_timeout}" gdb -batch -nx \
+            -ex "set pagination off" \
+            -ex "thread apply all bt" \
+            -p "${pid}" \
+            > "${stackfile}" 2>&1
+        gdb_rc=$?
+    else
+        echo "NOTE: 'timeout' unavailable; gdb bounded only by srun wall-time limit." \
+            >> "${stackfile}"
+        gdb -batch -nx \
+            -ex "set pagination off" \
+            -ex "thread apply all bt" \
+            -p "${pid}" \
+            >> "${stackfile}" 2>&1
+        gdb_rc=$?
+    fi
+
+    echo "gdb_rc=${gdb_rc}" >> "${stackfile}"
+
+    if [[ "${gdb_rc}" -eq 124 ]]; then
+        class="GDB_TIMEOUT"
+    elif grep -qi "ptrace\|Operation not permitted\|No such process\|Attaching to process.*failed\|Permission denied" "${stackfile}"; then
+        class="GDB_ATTACH_FAILED"
+    elif grep -q "reductions_mp_p_minval_sca_" "${stackfile}"; then
+        class="ALLREDUCE_MINVAL"
+    elif grep -q "pmpi_allreduce_\|PMPI_Allreduce\|MPI_Allreduce" "${stackfile}"; then
+        class="ALLREDUCE_OTHER"
+    elif grep -q "MPI_File\|MPI_FILE\|nf90_put\|nf_put\|H5Dwrite\|ADIO" "${stackfile}"; then
+        class="MPI_IO"
+    elif grep -q "MPI_Alltoall\|MPI_Alltoallv\|transpose_x_to_y\|transpose_y_to_z\|transpose_y_to_x\|transpose_z_to_y" "${stackfile}"; then
+        class="ALLTOALL_OR_TRANSPOSE"
+    elif grep -q "fi_opx_cq_read\|fi_cq_read\|opal_progress\|MPIDI_OFI\|poll_cq" "${stackfile}"; then
+        class="MPI_PROGRESS_ENGINE"
+    elif grep -q "MPI_Wait\|MPI_Waitall\|PMPI_Wait\|PMPI_Waitall" "${stackfile}"; then
+        class="WAIT"
+    else
+        class="OTHER"
+    fi
+
+    echo "${class} ${host} ${pid} ${stackfile}" > "${classfile}"
+    echo "${class} PID=${pid}" | tee -a "${node_summary}"
+done
+
+echo "Done node ${host}" | tee -a "${node_summary}"
+EOF
+
+    chmod +x "${worker}" || {
+        mlog "[StackDump] ERROR: failed to chmod worker script: ${worker}"
+        return 1
+    }
+
+    mlog "[StackDump] Launching one diagnostic task per node with srun --overlap..."
+
+    srun -p "${partition}" \
+        --overlap \
+        --jobid="${SLURM_JOB_ID}" \
+        --nodes="${nnodes}" \
+        --ntasks="${nnodes}" \
+        --ntasks-per-node=1 \
+        --time="${STACK_DUMP_TIME_LIMIT}" \
+        bash "${worker}" "${solver_pattern}" "${outdir}" \
+        > "${outdir}/srun_stackdump.out" \
+        2> "${outdir}/srun_stackdump.err"
+
+    srun_rc=$?
+
+    if [[ "${srun_rc}" -ne 0 ]]; then
+        mlog "[StackDump] WARNING: srun diagnostic step failed with rc=${srun_rc}."
+        mlog "[StackDump] WARNING: This may indicate --overlap is unsupported or blocked on this cluster."
+        mlog "[StackDump] WARNING: stdout=${outdir}/srun_stackdump.out"
+        mlog "[StackDump] WARNING: stderr=${outdir}/srun_stackdump.err"
+        return 1
+    fi
+
+    class_summary="${outdir}/classification_summary.txt"
+    counts_file="${outdir}/classification_counts.txt"
+
+    : > "${class_summary}"
+
+    find "${outdir}" -name 'class_*.txt' -type f -print0 \
+        | xargs -0 cat \
+        | sort \
+        > "${class_summary}" 2>/dev/null || true
+
+    awk '{count[$1]++} END {for (c in count) print c, count[c]}' "${class_summary}" \
+        | sort \
+        > "${counts_file}" 2>/dev/null || true
+
+    mlog "[StackDump] Stack dump complete."
+    mlog "[StackDump] Nodes file             : ${nodes_file}"
+    mlog "[StackDump] Classification summary : ${class_summary}"
+    mlog "[StackDump] Classification counts  : ${counts_file}"
+    mlog "[StackDump] Per-node summaries     : ${outdir}/summary_*.txt"
+    mlog "[StackDump] Full stack files       : ${outdir}/stack_*.txt"
+    mlog "================================================================"
+
+    return 0
 }
 
 gb_to_kb() {
@@ -738,10 +1086,17 @@ cleanup_watchers() {
     : # no background watchers in the unified design; kept for EXIT trap symmetry
 }
 
+validate_integer "${ESTIMATE_PERSISTENCE_SAMPLES}" "ESTIMATE_PERSISTENCE_SAMPLES"
 validate_integer "${MEMORY_GUARD_LOOKAHEAD_INTERVALS}" "MEMORY_GUARD_LOOKAHEAD_INTERVALS"
 validate_integer "${MEMORY_GUARD_PERSISTENCE_SAMPLES}" "MEMORY_GUARD_PERSISTENCE_SAMPLES"
 validate_integer "${MEMORY_RATE_WINDOW}" "MEMORY_RATE_WINDOW"
 validate_integer "${ELAPSED_STEP_WINDOW}" "ELAPSED_STEP_WINDOW"
+validate_integer "${STACK_DUMP_GDB_TIMEOUT_SECONDS}" "STACK_DUMP_GDB_TIMEOUT_SECONDS"
+
+[[ "${ESTIMATE_PERSISTENCE_SAMPLES}" -gt 0 ]]   || { mlog "[ERROR] ESTIMATE_PERSISTENCE_SAMPLES must be > 0"; exit 1; }
+[[ "${STACK_DUMP_ENABLED}" =~ ^[01]$ ]] || { mlog "[ERROR] STACK_DUMP_ENABLED must be 0 or 1"; exit 1; }
+[[ "${STACK_DUMP_GDB_TIMEOUT_SECONDS}" -gt 0 ]] || { mlog "[ERROR] STACK_DUMP_GDB_TIMEOUT_SECONDS must be > 0"; exit 1; }
+
 [[ "${HARD_CUTOFF_SECONDS}" =~ ^[0-9]+$ ]]          || { mlog "[ERROR] HARD_CUTOFF_SECONDS must be an integer"; exit 1; }
 [[ "${SAFETY_FACTOR}" =~ ^[0-9]+([.][0-9]+)?$ ]]    || { mlog "[ERROR] SAFETY_FACTOR must be a number"; exit 1; }
 [[ "${MEMORY_GUARD_LOOKAHEAD_INTERVALS}" -gt 0 ]]   || { mlog "[ERROR] MEMORY_GUARD_LOOKAHEAD_INTERVALS must be > 0"; exit 1; }
@@ -759,9 +1114,15 @@ WALL_TIME_SECONDS=$(parse_slurm_time_to_seconds "${WALL_TIME_STR}") || {
     exit 1
 }
 
+parse_slurm_time_to_seconds "${STACK_DUMP_TIME_LIMIT}" > /dev/null || {
+    mlog "[ERROR] STACK_DUMP_TIME_LIMIT is not a valid Slurm time string: ${STACK_DUMP_TIME_LIMIT}"
+    exit 1
+}
+
 # Resolve memory guard limits
 MEMORY_GUARD_NODE_LIMIT_RESOLVED_KB=0
 MEMORY_GUARD_TRIGGER_KB=0
+MEMORY_GUARD_HARD_STOP_PCT=0
 
 if [[ "${MEMORY_GUARD_ENABLED}" -eq 1 ]]; then
     USER_NODE_LIMIT_KB=0
@@ -793,6 +1154,9 @@ if [[ "${MEMORY_GUARD_ENABLED}" -eq 1 ]]; then
             -v lim="${MEMORY_GUARD_NODE_LIMIT_RESOLVED_KB}" \
             -v frac="${MEMORY_GUARD_UTILIZATION}" \
             'BEGIN { printf "%.0f\n", lim * frac }')
+
+        MEMORY_GUARD_HARD_STOP_PCT=$(awk -v frac="${MEMORY_GUARD_HARD_STOP_FRAC}" \
+            'BEGIN { printf "%.0f", frac * 100 }')
     else
         MEMORY_GUARD_ENABLED=0
     fi
@@ -845,6 +1209,9 @@ mlog "CPUs per task   : ${SLURM_CPUS_PER_TASK}"
 mlog "Wall time limit : ${WALL_TIME_STR}  (${WALL_TIME_SECONDS}s)"
 mlog "Hard cutoff     : ${HARD_CUTOFF_SECONDS}s remaining"
 mlog "Frozen timeout  : ${FROZEN_TIMEOUT_SECONDS}s"
+mlog "Stack dump enabled  : ${STACK_DUMP_ENABLED}"
+mlog "Stack dump limit    : ${STACK_DUMP_TIME_LIMIT}"
+mlog "GDB timeout/rank    : ${STACK_DUMP_GDB_TIMEOUT_SECONDS}s"
 mlog "Estimate persist: ${ESTIMATE_PERSISTENCE_SAMPLES} samples"
 mlog "Safety factor   : ${SAFETY_FACTOR}x"
 mlog "Memory guard    : ${MEMORY_GUARD_ENABLED}"
@@ -1613,6 +1980,8 @@ MEMORY_BAD_SAMPLES=0
 declare -a MEM_EPOCH_HISTORY=()
 declare -a MEM_RSS_HISTORY=()
 
+STACK_DUMP_DONE=0
+
 ELAPSED_SOURCE=""
 
 mlog "Monitor loop started. Polling '${OUTPUT_LOG}' every ${MONITOR_INTERVAL}s."
@@ -1651,7 +2020,6 @@ while kill -0 "${MPI_PID}" 2>/dev/null; do
 
             # HARD STOP: immediate restart at critical utilization (no persistence required)
             # Convert fraction to percentage for comparison
-            MEMORY_GUARD_HARD_STOP_PCT=$(awk -v frac="${MEMORY_GUARD_HARD_STOP_FRAC}" 'BEGIN { printf "%.0f", frac * 100 }')
             if [[ "${MEM_UTIL_PCT}" -ge "${MEMORY_GUARD_HARD_STOP_PCT}" ]]; then
                 mlog "[Monitor][Mem] rss=${CURRENT_MAXRSS_KB}KB (${MEM_UTIL_PCT}%) | lim=${MEMORY_GUARD_TRIGGER_KB}KB | STATUS: CRITICAL_HARD_STOP"
                 TRIGGER_REASON="MEMORY GUARD HARD STOP (MaxRSS at ${MEM_UTIL_PCT}% >= ${MEMORY_GUARD_HARD_STOP_PCT}% critical threshold)"
@@ -1846,6 +2214,19 @@ while kill -0 "${MPI_PID}" 2>/dev/null; do
             continue
         fi
         trap 'emergency_resubmit TERM' TERM
+
+        if [[ "${TRIGGER_REASON}" == FROZEN* ]]; then
+            if [[ "${STACK_DUMP_DONE}" -eq 0 ]]; then
+                mlog "[Monitor] Frozen trigger detected. Attempting MPI stack dump before restart sequence."
+
+                dump_mpi_stacks_for_frozen_job "${TRIGGER_REASON}" || \
+                    mlog "[Monitor] WARNING: MPI stack dump failed or was incomplete; continuing restart sequence."
+
+                STACK_DUMP_DONE=1
+            else
+                mlog "[Monitor] Frozen trigger detected, but stack dump was already attempted for this job. Skipping repeated dump."
+            fi
+        fi
 
         # from here onward, this monitor path owns the restart sequence
         # compute COMMON_TID
