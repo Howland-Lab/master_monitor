@@ -60,6 +60,10 @@
 #  Memory is sampled once per monitor cycle (MONITOR_INTERVAL) via sstat.
 #  The same sample feeds both the CSV file and the in-loop memory guard logic.
 #  There is no separate background memory-watcher subshell.
+#  When MEMORY_GUARD_SCOPE resolves to cgroup, the runtime ceiling is used
+#  directly. Some clusters expose a per-step cgroup ceiling rather than a
+#  per-task ceiling, so operators on those systems may still want to force
+#  MEMORY_GUARD_SCOPE=node for a conservative node-based comparison.
 #
 #  Time-per-step estimate
 #  ----------------------
@@ -145,6 +149,11 @@ MONITOR_SETTLE_TIME="${MONITOR_SETTLE_TIME:-300}"  # Default 5 minutes (300 seco
 # Memory-guard settings (node-based)
 MEMORY_GUARD_ENABLED="${MEMORY_GUARD_ENABLED:-1}"
 MEMORY_GUARD_LOOKAHEAD_INTERVALS="${MEMORY_GUARD_LOOKAHEAD_INTERVALS:-2}"
+# Scope of the memory probe/limit interpretation:
+#   auto = use runtime cgroup if finite, otherwise infer from site policy
+#   node = treat RSS/limit as node-based
+#   core/cpu = treat RSS/limit as CPU-based
+MEMORY_GUARD_SCOPE="${MEMORY_GUARD_SCOPE:-auto}"
 
 # Fraction of the per-node memory limit at which we trigger.
 # 1.0 means "at the limit"; 0.95 means "95% of the limit".
@@ -585,6 +594,81 @@ min_positive() {
         fi
     done
     echo "${min}"
+}
+
+get_slurm_config_value() {
+    local key="$1"
+    [[ -n "${key}" ]] || return 1
+    scontrol show config 2>/dev/null \
+        | awk -v key="${key}" '
+            $0 ~ ("^[[:space:]]*" key "[[:space:]]*=") {
+                sub(/^[^=]*=[[:space:]]*/, "");
+                print;
+                exit
+            }'
+}
+
+get_job_cpus_per_node_count() {
+    local cpus_per_node
+    cpus_per_node="${SLURM_JOB_CPUS_PER_NODE%%(*}"
+    [[ "${cpus_per_node}" =~ ^[0-9]+$ ]] || return 1
+    echo "${cpus_per_node}"
+}
+
+get_job_tasks_per_node_count() {
+    local tasks_per_node
+    # Supports homogeneous allocations like 16(x4). Heterogeneous lists such as
+    # 16,8 are intentionally treated conservatively by falling back to 1.
+    tasks_per_node="${SLURM_TASKS_PER_NODE%%(*}"
+    [[ "${tasks_per_node}" =~ ^[0-9]+$ ]] || return 1
+    echo "${tasks_per_node}"
+}
+
+get_job_cgroup_memory_limit_kb() {
+    local cgroup_path
+    local limit_file limit_value
+
+    cgroup_path="$(awk -F: '$1 == 0 || $2 == "memory" { print $3; exit }' /proc/self/cgroup 2>/dev/null)"
+    [[ -n "${cgroup_path}" ]] || return 1
+
+    for limit_file in \
+        "/sys/fs/cgroup${cgroup_path}/memory.max" \
+        "/sys/fs/cgroup${cgroup_path}/memory.limit_in_bytes"
+    do
+        [[ -r "${limit_file}" ]] || continue
+        limit_value="$(cat "${limit_file}" 2>/dev/null)"
+        [[ -n "${limit_value}" && "${limit_value}" != "max" ]] || continue
+        [[ "${limit_value}" =~ ^[0-9]+$ ]] || continue
+        echo $(( limit_value / 1024 ))
+        return 0
+    done
+
+    return 1
+}
+
+classify_memory_guard_scope() {
+    local select_params reqmem
+
+    if [[ "${MEMORY_GUARD_SCOPE}" != "auto" && -n "${MEMORY_GUARD_SCOPE}" ]]; then
+        echo "${MEMORY_GUARD_SCOPE}"
+        return 0
+    fi
+
+    reqmem="$(get_job_reqmem_raw || true)"
+    case "${reqmem}" in
+        *n) echo "node"; return 0 ;;
+        *c) echo "cpu"; return 0 ;;
+    esac
+
+    select_params="$(get_slurm_config_value SelectTypeParameters || true)"
+
+    case "${select_params}" in
+        *CR_CORE_MEMORY*) echo "core"; return 0 ;;
+        *CR_CPU_Memory*)  echo "cpu";  return 0 ;;
+    esac
+
+    echo "node"
+    return 0
 }
 
 get_job_nodelist() {
@@ -1108,6 +1192,17 @@ validate_integer "${STACK_DUMP_GDB_TIMEOUT_SECONDS}" "STACK_DUMP_GDB_TIMEOUT_SEC
 # Validate that the fraction is between 0 and 1
 HARD_STOP_CHECK=$(echo "${MEMORY_GUARD_HARD_STOP_FRAC} > 0 && ${MEMORY_GUARD_HARD_STOP_FRAC} <= 1" | bc 2>/dev/null)
 [[ "${HARD_STOP_CHECK}" -eq 1 ]] || { mlog "[ERROR] MEMORY_GUARD_HARD_STOP_FRAC must be between 0 and 1 (e.g., 0.97 for 97%)"; exit 1; }
+case "${MEMORY_GUARD_SCOPE}" in
+    auto|node|core|cpu) ;;
+    *) mlog "[ERROR] MEMORY_GUARD_SCOPE must be one of: auto, node, core, cpu"; exit 1 ;;
+esac
+[[ "${MEMORY_GUARD_UTILIZATION}" =~ ^[0-9]+([.][0-9]+)?$ ]] || { mlog "[ERROR] MEMORY_GUARD_UTILIZATION must be a positive number"; exit 1; }
+UTIL_RANGE_CHECK=$(echo \
+    "${MEMORY_GUARD_UTILIZATION} > 0 && \
+     ${MEMORY_GUARD_UTILIZATION} < 1 && \
+     ${MEMORY_GUARD_UTILIZATION} < ${MEMORY_GUARD_HARD_STOP_FRAC}" \
+    | bc 2>/dev/null)
+[[ "${UTIL_RANGE_CHECK}" -eq 1 ]] || { mlog "[ERROR] MEMORY_GUARD_UTILIZATION must be in (0,1) and < MEMORY_GUARD_HARD_STOP_FRAC"; exit 1; }
 
 WALL_TIME_SECONDS=$(parse_slurm_time_to_seconds "${WALL_TIME_STR}") || {
     echo "[ERROR] Failed to parse wall-time string: ${WALL_TIME_STR}" >&2
@@ -1121,10 +1216,17 @@ parse_slurm_time_to_seconds "${STACK_DUMP_TIME_LIMIT}" > /dev/null || {
 
 # Resolve memory guard limits
 MEMORY_GUARD_NODE_LIMIT_RESOLVED_KB=0
+MEMORY_GUARD_EFFECTIVE_LIMIT_KB=0
+MEMORY_GUARD_COMPARE_LIMIT_KB=0
 MEMORY_GUARD_TRIGGER_KB=0
 MEMORY_GUARD_HARD_STOP_PCT=0
+MEMORY_GUARD_SCOPE_RESOLVED="node"
+MEMORY_GUARD_SCOPE_SOURCE="disabled"
+MEMORY_GUARD_CPUS_PER_NODE=0
+MEMORY_GUARD_TASKS_PER_NODE=0
 
 if [[ "${MEMORY_GUARD_ENABLED}" -eq 1 ]]; then
+    CGROUP_LIMIT_KB=0
     USER_NODE_LIMIT_KB=0
     SLURM_NODE_LIMIT_KB=0
     SLURM_REQMEM_NODE_KB=0
@@ -1134,6 +1236,19 @@ if [[ "${MEMORY_GUARD_ENABLED}" -eq 1 ]]; then
             mlog "[ERROR] Invalid MEMORY_GUARD_NODE_LIMIT_GB='${MEMORY_GUARD_NODE_LIMIT_GB}'"
             exit 1
         }
+    fi
+
+    CGROUP_LIMIT_KB="$(get_job_cgroup_memory_limit_kb || echo 0)"
+    if [[ "${CGROUP_LIMIT_KB}" =~ ^[0-9]+$ ]] && [[ "${CGROUP_LIMIT_KB}" -gt 0 ]]; then
+        if [[ "${USER_NODE_LIMIT_KB}" -gt 0 ]]; then
+            MEMORY_GUARD_EFFECTIVE_LIMIT_KB="$(min_positive \
+                "${CGROUP_LIMIT_KB}" \
+                "${USER_NODE_LIMIT_KB}")"
+        else
+            MEMORY_GUARD_EFFECTIVE_LIMIT_KB="${CGROUP_LIMIT_KB}"
+        fi
+        MEMORY_GUARD_SCOPE_RESOLVED="cgroup"
+        MEMORY_GUARD_SCOPE_SOURCE="runtime-cgroup"
     fi
 
     FIRST_NODE="$(get_first_allocated_node || true)"
@@ -1148,10 +1263,51 @@ if [[ "${MEMORY_GUARD_ENABLED}" -eq 1 ]]; then
         "${SLURM_NODE_LIMIT_KB}" \
         "${SLURM_REQMEM_NODE_KB}")"
 
-    if [[ "${MEMORY_GUARD_NODE_LIMIT_RESOLVED_KB}" =~ ^[0-9]+$ ]] && \
-       [[ "${MEMORY_GUARD_NODE_LIMIT_RESOLVED_KB}" -gt 0 ]]; then
+    if [[ "${MEMORY_GUARD_EFFECTIVE_LIMIT_KB}" -le 0 ]]; then
+        MEMORY_GUARD_SCOPE_RESOLVED="$(classify_memory_guard_scope || echo node)"
+        MEMORY_GUARD_SCOPE_SOURCE="site-policy"
+        MEMORY_GUARD_EFFECTIVE_LIMIT_KB="${MEMORY_GUARD_NODE_LIMIT_RESOLVED_KB}"
+    fi
+
+    if [[ "${MEMORY_GUARD_EFFECTIVE_LIMIT_KB}" =~ ^[0-9]+$ ]] && \
+       [[ "${MEMORY_GUARD_EFFECTIVE_LIMIT_KB}" -gt 0 ]]; then
+        MEMORY_GUARD_COMPARE_LIMIT_KB="${MEMORY_GUARD_EFFECTIVE_LIMIT_KB}"
+        if [[ "${MEMORY_GUARD_SCOPE_RESOLVED}" == "node" ]]; then
+            MEMORY_GUARD_TASKS_PER_NODE="$(get_job_tasks_per_node_count || echo 0)"
+            if [[ "${MEMORY_GUARD_TASKS_PER_NODE}" =~ ^[0-9]+$ ]] && \
+               [[ "${MEMORY_GUARD_TASKS_PER_NODE}" -gt 0 ]]; then
+                MEMORY_GUARD_COMPARE_LIMIT_KB=$(awk \
+                    -v lim="${MEMORY_GUARD_EFFECTIVE_LIMIT_KB}" \
+                    -v denom="${MEMORY_GUARD_TASKS_PER_NODE}" \
+                    'BEGIN { printf "%.0f\n", lim / denom }')
+            fi
+        elif [[ "${MEMORY_GUARD_SCOPE_RESOLVED}" == "core" || \
+                "${MEMORY_GUARD_SCOPE_RESOLVED}" == "cpu" ]]; then
+            MEMORY_GUARD_CPUS_PER_NODE="$(get_job_cpus_per_node_count || echo 0)"
+            if [[ "${MEMORY_GUARD_CPUS_PER_NODE}" =~ ^[0-9]+$ ]] && \
+               [[ "${MEMORY_GUARD_CPUS_PER_NODE}" -gt 0 ]]; then
+                CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-1}"
+                [[ "${CPUS_PER_TASK}" =~ ^[0-9]+$ ]] || CPUS_PER_TASK=1
+                MEMORY_GUARD_COMPARE_LIMIT_KB=$(awk \
+                    -v lim="${MEMORY_GUARD_EFFECTIVE_LIMIT_KB}" \
+                    -v cpus_per_node="${MEMORY_GUARD_CPUS_PER_NODE}" \
+                    -v cpus_per_task="${CPUS_PER_TASK}" \
+                    'BEGIN { printf "%.0f\n", lim / cpus_per_node * cpus_per_task }')
+            else
+                MEMORY_GUARD_SCOPE_RESOLVED="node"
+                MEMORY_GUARD_SCOPE_SOURCE="fallback-node"
+                MEMORY_GUARD_TASKS_PER_NODE="$(get_job_tasks_per_node_count || echo 0)"
+                if [[ "${MEMORY_GUARD_TASKS_PER_NODE}" =~ ^[0-9]+$ ]] && \
+                   [[ "${MEMORY_GUARD_TASKS_PER_NODE}" -gt 0 ]]; then
+                    MEMORY_GUARD_COMPARE_LIMIT_KB=$(awk \
+                        -v lim="${MEMORY_GUARD_EFFECTIVE_LIMIT_KB}" \
+                        -v denom="${MEMORY_GUARD_TASKS_PER_NODE}" \
+                        'BEGIN { printf "%.0f\n", lim / denom }')
+                fi
+            fi
+        fi
         MEMORY_GUARD_TRIGGER_KB=$(awk \
-            -v lim="${MEMORY_GUARD_NODE_LIMIT_RESOLVED_KB}" \
+            -v lim="${MEMORY_GUARD_COMPARE_LIMIT_KB}" \
             -v frac="${MEMORY_GUARD_UTILIZATION}" \
             'BEGIN { printf "%.0f\n", lim * frac }')
 
@@ -1159,6 +1315,7 @@ if [[ "${MEMORY_GUARD_ENABLED}" -eq 1 ]]; then
             'BEGIN { printf "%.0f", frac * 100 }')
     else
         MEMORY_GUARD_ENABLED=0
+        MEMORY_GUARD_SCOPE_SOURCE="disabled"
     fi
 fi
 
@@ -1224,8 +1381,13 @@ mlog "Mem rate window : ${MEMORY_RATE_WINDOW} samples"
 mlog "Mem user limit/node : ${MEMORY_GUARD_NODE_LIMIT_GB:-unset} GB (${USER_NODE_LIMIT_KB:-0} KB)"
 mlog "Mem slurm real/node : ${SLURM_NODE_LIMIT_KB:-0} KB"
 mlog "Mem slurm req/node  : ${SLURM_REQMEM_NODE_KB:-0} KB"
-mlog "Mem limit/node      : ${MEMORY_GUARD_NODE_LIMIT_RESOLVED_KB} KB"
-mlog "Mem trigger/node    : ${MEMORY_GUARD_TRIGGER_KB} KB"
+mlog "Mem scope       : ${MEMORY_GUARD_SCOPE_RESOLVED} (${MEMORY_GUARD_SCOPE_SOURCE})"
+mlog "Mem cpus/node   : ${MEMORY_GUARD_CPUS_PER_NODE}"
+mlog "Mem tasks/node   : ${MEMORY_GUARD_TASKS_PER_NODE}"
+mlog "Mem limit/node  : ${MEMORY_GUARD_NODE_LIMIT_RESOLVED_KB} KB"
+mlog "Mem limit/effective : ${MEMORY_GUARD_EFFECTIVE_LIMIT_KB} KB"
+mlog "Mem limit/compare : ${MEMORY_GUARD_COMPARE_LIMIT_KB} KB"
+mlog "Mem trigger     : ${MEMORY_GUARD_TRIGGER_KB} KB"
 mlog "Mem CSV             : ${MEM_CSV}"
 mlog "Monitor log         : ${MONITOR_LOG}"
 mlog "Monitor settle time : ${MONITOR_SETTLE_TIME}s"
@@ -2011,8 +2173,8 @@ while kill -0 "${MPI_PID}" 2>/dev/null; do
 
         # Calculate utilization percentage
         MEM_UTIL_PCT=0
-        if [[ "${MEMORY_GUARD_ENABLED}" -eq 1 && "${MEMORY_GUARD_TRIGGER_KB}" -gt 0 ]]; then
-            MEM_UTIL_PCT=$(awk -v rss="${CURRENT_MAXRSS_KB}" -v lim="${MEMORY_GUARD_TRIGGER_KB}" \
+        if [[ "${MEMORY_GUARD_ENABLED}" -eq 1 && "${MEMORY_GUARD_COMPARE_LIMIT_KB}" -gt 0 ]]; then
+            MEM_UTIL_PCT=$(awk -v rss="${CURRENT_MAXRSS_KB}" -v lim="${MEMORY_GUARD_COMPARE_LIMIT_KB}" \
                 'BEGIN { printf "%.0f", (rss / lim) * 100 }')
         fi
 
@@ -2021,13 +2183,13 @@ while kill -0 "${MPI_PID}" 2>/dev/null; do
             # HARD STOP: immediate restart at critical utilization (no persistence required)
             # Convert fraction to percentage for comparison
             if [[ "${MEM_UTIL_PCT}" -ge "${MEMORY_GUARD_HARD_STOP_PCT}" ]]; then
-                mlog "[Monitor][Mem] rss=${CURRENT_MAXRSS_KB}KB (${MEM_UTIL_PCT}%) | lim=${MEMORY_GUARD_TRIGGER_KB}KB | STATUS: CRITICAL_HARD_STOP"
+                mlog "[Monitor][Mem] rss=${CURRENT_MAXRSS_KB}KB (${MEM_UTIL_PCT}%) | scope=${MEMORY_GUARD_SCOPE_RESOLVED} | cmp=${MEMORY_GUARD_COMPARE_LIMIT_KB}KB | trig=${MEMORY_GUARD_TRIGGER_KB}KB | STATUS: CRITICAL_HARD_STOP"
                 TRIGGER_REASON="MEMORY GUARD HARD STOP (MaxRSS at ${MEM_UTIL_PCT}% >= ${MEMORY_GUARD_HARD_STOP_PCT}% critical threshold)"
                 
             # Hard backstop: current RSS already at/above trigger
             elif [[ "${CURRENT_MAXRSS_KB}" -ge "${MEMORY_GUARD_TRIGGER_KB}" ]]; then
                 MEMORY_BAD_SAMPLES=$(( MEMORY_BAD_SAMPLES + 1 ))
-                mlog "[Monitor][Mem] rss=${CURRENT_MAXRSS_KB}KB (${MEM_UTIL_PCT}%) | lim=${MEMORY_GUARD_TRIGGER_KB}KB | STATUS: AT_LIMIT bad=${MEMORY_BAD_SAMPLES}/${MEMORY_GUARD_PERSISTENCE_SAMPLES}"
+                mlog "[Monitor][Mem] rss=${CURRENT_MAXRSS_KB}KB (${MEM_UTIL_PCT}%) | scope=${MEMORY_GUARD_SCOPE_RESOLVED} | cmp=${MEMORY_GUARD_COMPARE_LIMIT_KB}KB | trig=${MEMORY_GUARD_TRIGGER_KB}KB | STATUS: AT_LIMIT bad=${MEMORY_BAD_SAMPLES}/${MEMORY_GUARD_PERSISTENCE_SAMPLES}"
                 if [[ "${MEMORY_BAD_SAMPLES}" -ge "${MEMORY_GUARD_PERSISTENCE_SAMPLES}" ]]; then
                     TRIGGER_REASON="MEMORY GUARD (MaxRSS ${CURRENT_MAXRSS_KB} KB >= trigger ${MEMORY_GUARD_TRIGGER_KB} KB for ${MEMORY_BAD_SAMPLES} consecutive samples)"
                 fi
@@ -2040,7 +2202,7 @@ while kill -0 "${MPI_PID}" 2>/dev/null; do
                 if [[ -n "${MEM_RATE_KBPS}" ]]; then
                     if [[ "$(echo "${MEM_RATE_KBPS} <= 0" | bc 2>/dev/null)" -eq 1 ]]; then
                         [[ "${MEMORY_BAD_SAMPLES}" -gt 0 ]] && MEMORY_BAD_SAMPLES=0
-                        mlog "[Monitor][Mem] rss=${CURRENT_MAXRSS_KB}KB (${MEM_UTIL_PCT}%) | lim=${MEMORY_GUARD_TRIGGER_KB}KB | rate=${MEM_RATE_KBPS}KB/s | STATUS: DECREASING"
+                        mlog "[Monitor][Mem] rss=${CURRENT_MAXRSS_KB}KB (${MEM_UTIL_PCT}%) | scope=${MEMORY_GUARD_SCOPE_RESOLVED} | cmp=${MEMORY_GUARD_COMPARE_LIMIT_KB}KB | trig=${MEMORY_GUARD_TRIGGER_KB}KB | rate=${MEM_RATE_KBPS}KB/s | STATUS: DECREASING"
                     else
                         MEM_HEADROOM_KB=$(( MEMORY_GUARD_TRIGGER_KB - CURRENT_MAXRSS_KB ))
                         MEM_TIME_TO_LIMIT=$(echo "scale=0; ${MEM_HEADROOM_KB} / ${MEM_RATE_KBPS}" | bc 2>/dev/null)
@@ -2053,18 +2215,18 @@ while kill -0 "${MPI_PID}" 2>/dev/null; do
 
                         if [[ "${MEM_UNSAFE}" -eq 1 ]]; then
                             MEMORY_BAD_SAMPLES=$(( MEMORY_BAD_SAMPLES + 1 ))
-                            mlog "[Monitor][Mem] rss=${CURRENT_MAXRSS_KB}KB (${MEM_UTIL_PCT}%) | lim=${MEMORY_GUARD_TRIGGER_KB}KB | rate=${MEM_RATE_KBPS}KB/s | ttl=${MEM_TIME_TO_LIMIT}s < look=${MEM_LOOKAHEAD_SECONDS}s | STATUS: UNSAFE bad=${MEMORY_BAD_SAMPLES}/${MEMORY_GUARD_PERSISTENCE_SAMPLES}"
+                            mlog "[Monitor][Mem] rss=${CURRENT_MAXRSS_KB}KB (${MEM_UTIL_PCT}%) | scope=${MEMORY_GUARD_SCOPE_RESOLVED} | cmp=${MEMORY_GUARD_COMPARE_LIMIT_KB}KB | trig=${MEMORY_GUARD_TRIGGER_KB}KB | rate=${MEM_RATE_KBPS}KB/s | ttl=${MEM_TIME_TO_LIMIT}s < look=${MEM_LOOKAHEAD_SECONDS}s | STATUS: UNSAFE bad=${MEMORY_BAD_SAMPLES}/${MEMORY_GUARD_PERSISTENCE_SAMPLES}"
                             if [[ "${MEMORY_BAD_SAMPLES}" -ge "${MEMORY_GUARD_PERSISTENCE_SAMPLES}" ]]; then
                                 TRIGGER_REASON="MEMORY GUARD (MaxRSS projected to reach ${MEMORY_GUARD_TRIGGER_KB} KB in ${MEM_TIME_TO_LIMIT}s < ${MEM_LOOKAHEAD_SECONDS}s, persisted for ${MEMORY_BAD_SAMPLES} samples)"
                             fi
                         else
                             [[ "${MEMORY_BAD_SAMPLES}" -gt 0 ]] && MEMORY_BAD_SAMPLES=0
-                            mlog "[Monitor][Mem] rss=${CURRENT_MAXRSS_KB}KB (${MEM_UTIL_PCT}%) | lim=${MEMORY_GUARD_TRIGGER_KB}KB | rate=${MEM_RATE_KBPS}KB/s | ttl=${MEM_TIME_TO_LIMIT}s > look=${MEM_LOOKAHEAD_SECONDS}s | STATUS: SAFE"
+                            mlog "[Monitor][Mem] rss=${CURRENT_MAXRSS_KB}KB (${MEM_UTIL_PCT}%) | scope=${MEMORY_GUARD_SCOPE_RESOLVED} | cmp=${MEMORY_GUARD_COMPARE_LIMIT_KB}KB | trig=${MEMORY_GUARD_TRIGGER_KB}KB | rate=${MEM_RATE_KBPS}KB/s | ttl=${MEM_TIME_TO_LIMIT}s > look=${MEM_LOOKAHEAD_SECONDS}s | STATUS: SAFE"
                         fi
                     fi
                 else
                     [[ "${MEMORY_BAD_SAMPLES}" -gt 0 ]] && MEMORY_BAD_SAMPLES=0
-                    mlog "[Monitor][Mem] rss=${CURRENT_MAXRSS_KB}KB (${MEM_UTIL_PCT}%) | lim=${MEMORY_GUARD_TRIGGER_KB}KB | STATUS: WARMING (need 2+ samples)"
+                    mlog "[Monitor][Mem] rss=${CURRENT_MAXRSS_KB}KB (${MEM_UTIL_PCT}%) | scope=${MEMORY_GUARD_SCOPE_RESOLVED} | cmp=${MEMORY_GUARD_COMPARE_LIMIT_KB}KB | trig=${MEMORY_GUARD_TRIGGER_KB}KB | STATUS: WARMING (need 2+ samples)"
                 fi
             fi
         else

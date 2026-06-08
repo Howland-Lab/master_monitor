@@ -58,6 +58,12 @@ MONITOR_SETTLE_TIME=600
 # 1 = enabled, 0 = disabled
 MEMORY_GUARD_ENABLED=1
 
+# Memory scope override used by the guard.
+# auto = use runtime cgroup if finite, otherwise infer from site policy
+# node = compare against a node-scoped limit
+# core/cpu = compare against a CPU-scoped limit
+MEMORY_GUARD_SCOPE=auto
+
 # Per-node memory limit in GB used by the guard.
 # The master script resolves the effective node limit conservatively using the
 # minimum of:
