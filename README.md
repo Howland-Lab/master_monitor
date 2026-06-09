@@ -284,6 +284,8 @@ The script includes several defensive mechanisms:
 
 Still, users should validate the setup for their own workflow before relying on it for production chains.
 
+The frozen-job stack dump is best-effort only. On systems that set `ptrace_scope` to a restrictive value, external `gdb -p` attach can be blocked by the kernel even when the solver is still alive. In that case the monitor now records a process snapshot (`ps`, `wchan`, current syscall, open file descriptors, and any readable `/proc` metadata) instead of a real backtrace. The fallback snapshot is also auto-classified as `MPI_IO` or `KERNEL_FS_WAIT` when the evidence points to file-write or page-writeback stalls. That is usually enough to show whether ranks are blocked in `write`, `fsync`, page-writeback, or a related kernel wait state. It is still not a substitute for an in-process stack trace or a core dump.
+
 ---
 
 ## Recommended Validation Before Production Use

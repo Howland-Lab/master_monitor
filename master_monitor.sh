@@ -322,7 +322,8 @@ dump_mpi_stacks_for_frozen_job() {
     local solver_pattern
     local timestamp outdir worker nodes_file
     local nodelist_raw nnodes partition srun_rc
-    local class_summary counts_file
+    local class_summary counts_file stack_timeout_secs
+    local ptrace_scope_hint=""
 
     if [[ "${STACK_DUMP_ENABLED}" != "1" ]]; then
         mlog "[StackDump] Disabled by STACK_DUMP_ENABLED=${STACK_DUMP_ENABLED}."
@@ -364,6 +365,11 @@ dump_mpi_stacks_for_frozen_job() {
     mlog "[StackDump] Solver pattern : ${solver_pattern}"
     mlog "[StackDump] Output dir     : ${outdir}"
 
+    ptrace_scope_hint="$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo unknown)"
+    if [[ "${ptrace_scope_hint}" =~ ^[0-9]+$ && "${ptrace_scope_hint}" -ge 2 ]]; then
+        mlog "[StackDump] NOTE: monitor-node ptrace_scope=${ptrace_scope_hint}; each worker re-checks its own node."
+    fi
+
     nodelist_raw="$(get_job_nodelist || true)"
     if [[ -z "${nodelist_raw}" ]]; then
         nodelist_raw="$(squeue -j "${SLURM_JOB_ID}" -h -o "%N" 2>/dev/null || true)"
@@ -395,7 +401,7 @@ dump_mpi_stacks_for_frozen_job() {
     mlog "[StackDump] Partition      : ${partition}"
     mlog "[StackDump] Time limit     : ${STACK_DUMP_TIME_LIMIT}"
 
-    cat > "${worker}" <<'EOF'
+cat > "${worker}" <<'EOF'
 #!/usr/bin/env bash
 set -u
 
@@ -416,9 +422,11 @@ node_summary="${REMOTE_OUTDIR}/summary_${short_host}.txt"
     echo "Solver pattern: ${SOLVER_PATTERN}"
 } | tee -a "${node_summary}"
 
+gdb_available=1
 if ! command -v gdb >/dev/null 2>&1; then
-    echo "ERROR: gdb not found on ${host}" | tee -a "${node_summary}"
-    exit 0
+    gdb_available=0
+    echo "WARNING: gdb not found on ${host}; will fall back to process snapshots." \
+        | tee -a "${node_summary}"
 fi
 
 ptrace_scope="$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo unknown)"
@@ -428,6 +436,121 @@ if [[ "${ptrace_scope}" =~ ^[0-9]+$ && "${ptrace_scope}" -ge 2 ]]; then
     echo "WARNING: ptrace_scope=${ptrace_scope}; gdb attach may be blocked on this node." \
         | tee -a "${node_summary}"
 fi
+
+dump_process_snapshot() {
+    local pid="$1"
+    local outfile="$2"
+
+    dump_fd_targets() {
+        local fd_dir="/proc/${pid}/fd"
+        local fd_link target
+
+        [[ -d "${fd_dir}" ]] || return 0
+
+        echo "---- /proc/${pid}/fd ----"
+        for fd_link in "${fd_dir}"/*; do
+            [[ -e "${fd_link}" ]] || continue
+            target="$(readlink "${fd_link}" 2>/dev/null || echo unknown)"
+            echo "$(basename "${fd_link}") -> ${target}"
+        done
+    }
+
+    {
+        echo "---- PROCESS SNAPSHOT ----"
+        echo "PID: ${pid}"
+        echo "Host: ${host}"
+        echo "Time: $(date)"
+        if ps -p "${pid}" -o pid=,ppid=,stat=,pcpu=,pmem=,wchan=,etime=,cmd= >/dev/null 2>&1; then
+            echo "---- ps ----"
+            ps -p "${pid}" -o pid=,ppid=,stat=,pcpu=,pmem=,wchan=,etime=,cmd=
+        fi
+        if [[ -r "/proc/${pid}/status" ]]; then
+            echo "---- /proc/${pid}/status ----"
+            cat "/proc/${pid}/status"
+        fi
+        if [[ -r "/proc/${pid}/wchan" ]]; then
+            echo "---- /proc/${pid}/wchan ----"
+            cat "/proc/${pid}/wchan"
+        fi
+        if [[ -r "/proc/${pid}/syscall" ]]; then
+            echo "---- /proc/${pid}/syscall ----"
+            cat "/proc/${pid}/syscall"
+        fi
+        if [[ -r "/proc/${pid}/stack" ]]; then
+            echo "---- /proc/${pid}/stack ----"
+            cat "/proc/${pid}/stack"
+        fi
+        dump_fd_targets
+    } >> "${outfile}" 2>&1
+}
+
+snapshot_syscall_name() {
+    local file="$1"
+    local syscall_num=""
+    local arch
+
+    syscall_num="$(
+        awk '
+            /^---- \/proc\/[0-9]+\/syscall ----$/ { getline; print $1; exit }
+        ' "${file}" 2>/dev/null || true
+    )"
+
+    arch="$(uname -m 2>/dev/null || echo unknown)"
+
+    case "${arch}" in
+        x86_64|amd64)
+            case "${syscall_num}" in
+                1)   echo "write" ;;
+                18)  echo "pwrite64" ;;
+                20)  echo "writev" ;;
+                40)  echo "sendfile" ;;
+                74)  echo "fsync" ;;
+                75)  echo "fdatasync" ;;
+                328) echo "pwritev2" ;;
+                *)
+                    echo ""
+                    ;;
+            esac
+            ;;
+        *)
+            echo ""
+            ;;
+    esac
+}
+
+classify_snapshot_artifacts() {
+    local file="$1"
+    local syscall_name=""
+
+    # Direct MPI-IO/library clues.
+    if grep -Eqi 'MPI_File|MPI_FILE|MPI_File_write|MPI_File_write_at|MPI_File_write_all|MPI_File_write_shared|ADIO|H5Dwrite|nf90_put|nf_put' "${file}"; then
+        echo "MPI_IO"
+        return 0
+    fi
+
+    syscall_name="$(snapshot_syscall_name "${file}")"
+
+    # If the live syscall is write-like and the snapshot shows filesystem or
+    # page-writeback pressure, treat it as an I/O stall.
+    if [[ "${syscall_name}" =~ ^(write|writev|pwrite64|pwritev2|fsync|fdatasync|sendfile)$ ]]; then
+        if grep -Eqi 'writeback|page_writeback|balance_dirty_pages|wait_on_page_writeback|io_schedule|io_schedule_timeout|generic_file_write_iter|filemap|iomap|ext4|xfs|nfs|lustre|osc_|ldlm|ptlrpc|btrfs|fuse|overlayfs|blk_mq|submit_bio|flush-.*write' "${file}"; then
+            echo "KERNEL_FS_WAIT"
+            return 0
+        fi
+
+        echo "MPI_IO"
+        return 0
+    fi
+
+    # Kernel-side filesystem wait channels and stacks that usually indicate
+    # blocked file output, even if the syscall could not be decoded.
+    if grep -Eqi 'writeback|page_writeback|balance_dirty_pages|wait_on_page_writeback|io_schedule|io_schedule_timeout|generic_file_write_iter|filemap|iomap|ext4|xfs|nfs|lustre|osc_|ldlm|ptlrpc|btrfs|fuse|overlayfs|blk_mq|submit_bio|flush-.*write' "${file}"; then
+        echo "KERNEL_FS_WAIT"
+        return 0
+    fi
+
+    echo "OTHER_SNAPSHOT"
+}
 
 run_user="$(id -un 2>/dev/null || echo "${USER:-}")"
 
@@ -443,6 +566,7 @@ mapfile -t pids < <(
 
         cmd="$(ps -p "${pid}" -o cmd= 2>/dev/null || true)"
 
+        # Skip launcher shells and the diagnostic step itself.
         case "${cmd}" in
             *grep*|*bash*|*dump_mpi_stacks*|*worker_dump_stacks*|*srun*|*ibrun*|*mpirun*|*mpiexec*|*hydra_pmi_proxy*)
                 ;;
@@ -468,7 +592,32 @@ for pid in "${pids[@]}"; do
 
     echo "Dumping PID ${pid} on ${short_host}" | tee -a "${node_summary}"
 
+    if [[ "${gdb_available}" -eq 0 ]]; then
+        dump_process_snapshot "${pid}" "${stackfile}"
+        class="$(classify_snapshot_artifacts "${stackfile}")"
+        if [[ "${class}" == "OTHER_SNAPSHOT" ]]; then
+            class="NO_GDB_AVAILABLE"
+        fi
+        echo "${class} ${host} ${pid} ${stackfile}" > "${classfile}"
+        echo "${class} PID=${pid}" | tee -a "${node_summary}"
+        continue
+    fi
+
+    if [[ "${ptrace_scope}" =~ ^[0-9]+$ && "${ptrace_scope}" -ge 2 ]]; then
+        echo "Skipping gdb attach because ptrace_scope=${ptrace_scope} blocks external attach." \
+            | tee -a "${node_summary}"
+        dump_process_snapshot "${pid}" "${stackfile}"
+        class="$(classify_snapshot_artifacts "${stackfile}")"
+        if [[ "${class}" == "OTHER_SNAPSHOT" ]]; then
+            class="PTRACE_SCOPE_BLOCKED"
+        fi
+        echo "${class} ${host} ${pid} ${stackfile}" > "${classfile}"
+        echo "${class} PID=${pid}" | tee -a "${node_summary}"
+        continue
+    fi
+
     gdb_timeout="${STACK_DUMP_GDB_TIMEOUT_SECONDS:-60}"
+    gdb_rc=0
 
     if command -v timeout >/dev/null 2>&1; then
         timeout "${gdb_timeout}" gdb -batch -nx \
@@ -491,9 +640,14 @@ for pid in "${pids[@]}"; do
     echo "gdb_rc=${gdb_rc}" >> "${stackfile}"
 
     if [[ "${gdb_rc}" -eq 124 ]]; then
+        kill -CONT "${pid}" 2>/dev/null || true
         class="GDB_TIMEOUT"
     elif grep -qi "ptrace\|Operation not permitted\|No such process\|Attaching to process.*failed\|Permission denied" "${stackfile}"; then
-        class="GDB_ATTACH_FAILED"
+        dump_process_snapshot "${pid}" "${stackfile}"
+        class="$(classify_snapshot_artifacts "${stackfile}")"
+        if [[ "${class}" == "OTHER_SNAPSHOT" ]]; then
+            class="GDB_ATTACH_FAILED"
+        fi
     elif grep -q "reductions_mp_p_minval_sca_" "${stackfile}"; then
         class="ALLREDUCE_MINVAL"
     elif grep -q "pmpi_allreduce_\|PMPI_Allreduce\|MPI_Allreduce" "${stackfile}"; then
@@ -524,18 +678,41 @@ EOF
 
     mlog "[StackDump] Launching one diagnostic task per node with srun --overlap..."
 
-    srun -p "${partition}" \
-        --overlap \
-        --jobid="${SLURM_JOB_ID}" \
-        --nodes="${nnodes}" \
-        --ntasks="${nnodes}" \
-        --ntasks-per-node=1 \
-        --time="${STACK_DUMP_TIME_LIMIT}" \
-        bash "${worker}" "${solver_pattern}" "${outdir}" \
-        > "${outdir}/srun_stackdump.out" \
-        2> "${outdir}/srun_stackdump.err"
+    stack_timeout_secs=$(
+        parse_slurm_time_to_seconds "${STACK_DUMP_TIME_LIMIT}"
+    ) || {
+        mlog "[StackDump] ERROR: failed to parse STACK_DUMP_TIME_LIMIT=${STACK_DUMP_TIME_LIMIT}."
+        return 1
+    }
+    stack_timeout_secs=$(( stack_timeout_secs + 30 ))
 
-    srun_rc=$?
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "${stack_timeout_secs}" \
+            srun -p "${partition}" \
+                --overlap \
+                --jobid="${SLURM_JOB_ID}" \
+                --nodes="${nnodes}" \
+                --ntasks="${nnodes}" \
+                --ntasks-per-node=1 \
+                --time="${STACK_DUMP_TIME_LIMIT}" \
+                bash "${worker}" "${solver_pattern}" "${outdir}" \
+                > "${outdir}/srun_stackdump.out" \
+                2> "${outdir}/srun_stackdump.err"
+        srun_rc=$?
+    else
+        mlog "[StackDump] WARNING: 'timeout' unavailable; srun step is bounded only by Slurm and job wall time."
+        srun -p "${partition}" \
+            --overlap \
+            --jobid="${SLURM_JOB_ID}" \
+            --nodes="${nnodes}" \
+            --ntasks="${nnodes}" \
+            --ntasks-per-node=1 \
+            --time="${STACK_DUMP_TIME_LIMIT}" \
+            bash "${worker}" "${solver_pattern}" "${outdir}" \
+            > "${outdir}/srun_stackdump.out" \
+            2> "${outdir}/srun_stackdump.err"
+        srun_rc=$?
+    fi
 
     if [[ "${srun_rc}" -ne 0 ]]; then
         mlog "[StackDump] WARNING: srun diagnostic step failed with rc=${srun_rc}."
