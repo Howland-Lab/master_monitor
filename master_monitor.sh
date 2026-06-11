@@ -151,8 +151,8 @@ MEMORY_GUARD_ENABLED="${MEMORY_GUARD_ENABLED:-1}"
 MEMORY_GUARD_LOOKAHEAD_INTERVALS="${MEMORY_GUARD_LOOKAHEAD_INTERVALS:-2}"
 # Scope of the memory probe/limit interpretation:
 #   auto = use runtime cgroup if finite, otherwise infer from site policy
-#   node = treat RSS/limit as node-based
-#   core/cpu = treat RSS/limit as CPU-based
+#   node = compare node-scoped RSS against the full per-node limit
+#   core/cpu = compare task-scoped MaxRSS against the task's CPU share
 MEMORY_GUARD_SCOPE="${MEMORY_GUARD_SCOPE:-auto}"
 
 # Fraction of the per-node memory limit at which we trigger.
@@ -1451,13 +1451,6 @@ if [[ "${MEMORY_GUARD_ENABLED}" -eq 1 ]]; then
         MEMORY_GUARD_COMPARE_LIMIT_KB="${MEMORY_GUARD_EFFECTIVE_LIMIT_KB}"
         if [[ "${MEMORY_GUARD_SCOPE_RESOLVED}" == "node" ]]; then
             MEMORY_GUARD_TASKS_PER_NODE="$(get_job_tasks_per_node_count || echo 0)"
-            if [[ "${MEMORY_GUARD_TASKS_PER_NODE}" =~ ^[0-9]+$ ]] && \
-               [[ "${MEMORY_GUARD_TASKS_PER_NODE}" -gt 0 ]]; then
-                MEMORY_GUARD_COMPARE_LIMIT_KB=$(awk \
-                    -v lim="${MEMORY_GUARD_EFFECTIVE_LIMIT_KB}" \
-                    -v denom="${MEMORY_GUARD_TASKS_PER_NODE}" \
-                    'BEGIN { printf "%.0f\n", lim / denom }')
-            fi
         elif [[ "${MEMORY_GUARD_SCOPE_RESOLVED}" == "core" || \
                 "${MEMORY_GUARD_SCOPE_RESOLVED}" == "cpu" ]]; then
             MEMORY_GUARD_CPUS_PER_NODE="$(get_job_cpus_per_node_count || echo 0)"
@@ -1474,13 +1467,6 @@ if [[ "${MEMORY_GUARD_ENABLED}" -eq 1 ]]; then
                 MEMORY_GUARD_SCOPE_RESOLVED="node"
                 MEMORY_GUARD_SCOPE_SOURCE="fallback-node"
                 MEMORY_GUARD_TASKS_PER_NODE="$(get_job_tasks_per_node_count || echo 0)"
-                if [[ "${MEMORY_GUARD_TASKS_PER_NODE}" =~ ^[0-9]+$ ]] && \
-                   [[ "${MEMORY_GUARD_TASKS_PER_NODE}" -gt 0 ]]; then
-                    MEMORY_GUARD_COMPARE_LIMIT_KB=$(awk \
-                        -v lim="${MEMORY_GUARD_EFFECTIVE_LIMIT_KB}" \
-                        -v denom="${MEMORY_GUARD_TASKS_PER_NODE}" \
-                        'BEGIN { printf "%.0f\n", lim / denom }')
-                fi
             fi
         fi
         MEMORY_GUARD_TRIGGER_KB=$(awk \
