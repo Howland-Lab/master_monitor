@@ -152,7 +152,8 @@ MEMORY_GUARD_LOOKAHEAD_INTERVALS="${MEMORY_GUARD_LOOKAHEAD_INTERVALS:-2}"
 # Scope of the memory probe/limit interpretation:
 #   auto = use runtime cgroup if finite, otherwise infer from site policy
 #   node = compare node-scoped RSS against the full per-node limit
-#   core/cpu = compare task-scoped MaxRSS against the task's CPU share
+#   core = compare task MaxRSS against its physical-core memory share
+#   cpu = compare task MaxRSS against its logical-CPU memory share
 MEMORY_GUARD_SCOPE="${MEMORY_GUARD_SCOPE:-auto}"
 
 # Fraction of the per-node memory limit at which we trigger.
@@ -872,6 +873,34 @@ get_node_realmemory_kb() {
     echo $(( mem_mb * 1024 ))
 }
 
+get_node_topology_value() {
+    local node="$1"
+    local key="$2"
+    [[ -n "${node}" && -n "${key}" ]] || return 1
+    scontrol show node "${node}" 2>/dev/null \
+        | tr ' ' '\n' \
+        | awk -F= -v key="${key}" '$1==key{print $2; exit}'
+}
+
+get_node_logical_cpus_count() {
+    local node="$1"
+    local cpu_total
+    cpu_total="$(get_node_topology_value "${node}" "CPUTot")"
+    [[ "${cpu_total}" =~ ^[0-9]+$ ]] && [[ "${cpu_total}" -gt 0 ]] || return 1
+    echo "${cpu_total}"
+}
+
+get_node_physical_cores_count() {
+    local node="$1"
+    local cpu_total threads_per_core
+    cpu_total="$(get_node_topology_value "${node}" "CPUTot")"
+    threads_per_core="$(get_node_topology_value "${node}" "ThreadsPerCore")"
+    [[ "${cpu_total}" =~ ^[0-9]+$ ]] && [[ "${cpu_total}" -gt 0 ]] || return 1
+    [[ "${threads_per_core}" =~ ^[0-9]+$ ]] && [[ "${threads_per_core}" -gt 0 ]] || return 1
+    (( cpu_total % threads_per_core == 0 )) || return 1
+    echo $(( cpu_total / threads_per_core ))
+}
+
 get_job_reqmem_raw() {
     scontrol show job -o "${SLURM_JOB_ID}" 2>/dev/null \
         | tr ' ' '\n' \
@@ -1400,6 +1429,8 @@ MEMORY_GUARD_HARD_STOP_PCT=0
 MEMORY_GUARD_SCOPE_RESOLVED="node"
 MEMORY_GUARD_SCOPE_SOURCE="disabled"
 MEMORY_GUARD_CPUS_PER_NODE=0
+MEMORY_GUARD_CORES_PER_NODE=0
+MEMORY_GUARD_DIVISOR_PER_NODE=0
 MEMORY_GUARD_TASKS_PER_NODE=0
 
 if [[ "${MEMORY_GUARD_ENABLED}" -eq 1 ]]; then
@@ -1431,6 +1462,8 @@ if [[ "${MEMORY_GUARD_ENABLED}" -eq 1 ]]; then
     FIRST_NODE="$(get_first_allocated_node || true)"
     if [[ -n "${FIRST_NODE}" ]]; then
         SLURM_NODE_LIMIT_KB="$(get_node_realmemory_kb "${FIRST_NODE}" || echo 0)"
+        MEMORY_GUARD_CPUS_PER_NODE="$(get_node_logical_cpus_count "${FIRST_NODE}" || echo 0)"
+        MEMORY_GUARD_CORES_PER_NODE="$(get_node_physical_cores_count "${FIRST_NODE}" || echo 0)"
     fi
 
     SLURM_REQMEM_NODE_KB="$(get_job_reqmem_kb_per_node || echo 0)"
@@ -1451,18 +1484,27 @@ if [[ "${MEMORY_GUARD_ENABLED}" -eq 1 ]]; then
         MEMORY_GUARD_COMPARE_LIMIT_KB="${MEMORY_GUARD_EFFECTIVE_LIMIT_KB}"
         if [[ "${MEMORY_GUARD_SCOPE_RESOLVED}" == "node" ]]; then
             MEMORY_GUARD_TASKS_PER_NODE="$(get_job_tasks_per_node_count || echo 0)"
-        elif [[ "${MEMORY_GUARD_SCOPE_RESOLVED}" == "core" || \
-                "${MEMORY_GUARD_SCOPE_RESOLVED}" == "cpu" ]]; then
-            MEMORY_GUARD_CPUS_PER_NODE="$(get_job_cpus_per_node_count || echo 0)"
-            if [[ "${MEMORY_GUARD_CPUS_PER_NODE}" =~ ^[0-9]+$ ]] && \
-               [[ "${MEMORY_GUARD_CPUS_PER_NODE}" -gt 0 ]]; then
+        elif [[ "${MEMORY_GUARD_SCOPE_RESOLVED}" == "core" ]]; then
+            MEMORY_GUARD_DIVISOR_PER_NODE="${MEMORY_GUARD_CORES_PER_NODE}"
+        elif [[ "${MEMORY_GUARD_SCOPE_RESOLVED}" == "cpu" ]]; then
+            if [[ ! "${MEMORY_GUARD_CPUS_PER_NODE}" =~ ^[0-9]+$ ]] || \
+               [[ "${MEMORY_GUARD_CPUS_PER_NODE}" -le 0 ]]; then
+                MEMORY_GUARD_CPUS_PER_NODE="$(get_job_cpus_per_node_count || echo 0)"
+            fi
+            MEMORY_GUARD_DIVISOR_PER_NODE="${MEMORY_GUARD_CPUS_PER_NODE}"
+        fi
+
+        if [[ "${MEMORY_GUARD_SCOPE_RESOLVED}" == "core" || \
+              "${MEMORY_GUARD_SCOPE_RESOLVED}" == "cpu" ]]; then
+            if [[ "${MEMORY_GUARD_DIVISOR_PER_NODE}" =~ ^[0-9]+$ ]] && \
+               [[ "${MEMORY_GUARD_DIVISOR_PER_NODE}" -gt 0 ]]; then
                 CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-1}"
                 [[ "${CPUS_PER_TASK}" =~ ^[0-9]+$ ]] || CPUS_PER_TASK=1
                 MEMORY_GUARD_COMPARE_LIMIT_KB=$(awk \
                     -v lim="${MEMORY_GUARD_EFFECTIVE_LIMIT_KB}" \
-                    -v cpus_per_node="${MEMORY_GUARD_CPUS_PER_NODE}" \
+                    -v units_per_node="${MEMORY_GUARD_DIVISOR_PER_NODE}" \
                     -v cpus_per_task="${CPUS_PER_TASK}" \
-                    'BEGIN { printf "%.0f\n", lim / cpus_per_node * cpus_per_task }')
+                    'BEGIN { printf "%.0f\n", lim / units_per_node * cpus_per_task }')
             else
                 MEMORY_GUARD_SCOPE_RESOLVED="node"
                 MEMORY_GUARD_SCOPE_SOURCE="fallback-node"
@@ -1546,6 +1588,8 @@ mlog "Mem slurm real/node : ${SLURM_NODE_LIMIT_KB:-0} KB"
 mlog "Mem slurm req/node  : ${SLURM_REQMEM_NODE_KB:-0} KB"
 mlog "Mem scope       : ${MEMORY_GUARD_SCOPE_RESOLVED} (${MEMORY_GUARD_SCOPE_SOURCE})"
 mlog "Mem cpus/node   : ${MEMORY_GUARD_CPUS_PER_NODE}"
+mlog "Mem cores/node  : ${MEMORY_GUARD_CORES_PER_NODE}"
+mlog "Mem divisor/node: ${MEMORY_GUARD_DIVISOR_PER_NODE}"
 mlog "Mem tasks/node   : ${MEMORY_GUARD_TASKS_PER_NODE}"
 mlog "Mem limit/node  : ${MEMORY_GUARD_NODE_LIMIT_RESOLVED_KB} KB"
 mlog "Mem limit/effective : ${MEMORY_GUARD_EFFECTIVE_LIMIT_KB} KB"

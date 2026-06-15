@@ -61,7 +61,8 @@ MEMORY_GUARD_ENABLED=1
 # Memory scope override used by the guard.
 # auto = use runtime cgroup if finite, otherwise infer from site policy
 # node = compare node-scoped RSS against the full per-node limit
-# core/cpu = compare task-scoped MaxRSS against the task's CPU share
+# core = compare task MaxRSS against its physical-core memory share
+# cpu = compare task MaxRSS against its logical-CPU memory share
 MEMORY_GUARD_SCOPE=auto
 
 # Per-node memory limit in GB used by the guard.
