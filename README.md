@@ -146,7 +146,8 @@ The monitor loop periodically checks:
 A restart can be triggered by:
 
 * hard wall-time cutoff,
-* persistent estimate that the job cannot safely reach the next restart dump,
+* persistent estimate that the job cannot safely reach the nearer of the next
+  restart dump or the simulation stop time,
 * frozen execution,
 * unsafe projected memory growth,
 * emergency signal trapping.
@@ -217,11 +218,41 @@ If these log lines are not available, the script falls back to a coarser estimat
 * current step index,
 * previous step index.
 
+The monitor also reads `tstop` from both simulation input files and uses the
+smaller value. From the latest `Time` and `Current dt` records, it estimates
+the number of frames remaining until simulation completion. The wall-time
+guard compares the available time against the nearer of simulation completion
+and the next restart dump. If the end-time records are unavailable, the
+existing restart-dump estimate remains in effect.
+
+Primary and precursor restart intervals may differ. The monitor reads each
+domain's `restartFile_TID` and `t_restartDump` and calculates the next future
+TIDX belonging to both dump schedules. If the schedules never intersect, only
+the simulation-end estimate and hard cutoff remain available.
+
+After the log reaches `tstop`, restart submission is disabled, but the launcher
+remains supervised for `END_SHUTDOWN_GRACE_SECONDS`. A launcher that does not
+exit during that grace period is terminated and reported as a failure.
+If the memory hard-stop is crossed during this shutdown period, the launcher
+is terminated immediately without submitting another restart.
+
 ---
 
 ## Restart Logic
 
 For coupled workflows, the script searches for the latest restart index that exists in both required restart streams. This prevents the next job from restarting one simulation from a point that is not available in the other.
+
+Normal and emergency child submissions use an `afterany` dependency on the
+current job. If compute-node submission is unavailable, the script writes a
+configuration-scoped `.<job-script>.restart_ready` marker and exits
+unsuccessfully. An external controller is required to consume that marker and
+submit a successor.
+
+Memory accounting can be selected independently of automatic Slurm scope
+classification. Use `MEMORY_GUARD_ACCOUNTING=physical-core` for ARCHER2-like
+SMT accounting and `logical-cpu` for Anvil/Stampede3-like CPU accounting.
+Physical-core mode converts logical CPUs per task using the node's reported
+`ThreadsPerCore`.
 
 Once a valid common restart point is found, the script updates the relevant input-file variables, typically including:
 

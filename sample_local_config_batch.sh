@@ -54,6 +54,16 @@ ELAPSED_STEP_WINDOW=5
 # Default is 5 minutes (300 seconds)
 MONITOR_SETTLE_TIME=600  
 
+# Once the simulation reaches tstop, supervise normal MPI shutdown for this
+# many seconds before terminating a hung launcher without restarting.
+END_SHUTDOWN_GRACE_SECONDS=300
+
+# Grace period after TERM before escalating launcher shutdown to KILL.
+MPI_TERMINATION_GRACE_SECONDS=30
+
+# Maximum time for an already-running restart handoff to finish after SIGTERM.
+EMERGENCY_HANDOFF_DEADLINE_SECONDS=45
+
 # Enable proactive memory-based restart logic.
 # 1 = enabled, 0 = disabled
 MEMORY_GUARD_ENABLED=1
@@ -64,6 +74,12 @@ MEMORY_GUARD_ENABLED=1
 # core = compare task MaxRSS against its physical-core memory share
 # cpu = compare task MaxRSS against its logical-CPU memory share
 MEMORY_GUARD_SCOPE=auto
+
+# Site accounting override:
+# auto          = infer from Slurm policy
+# physical-core = ARCHER2-like accounting (SMT threads share a core allowance)
+# logical-cpu   = Anvil/Stampede3-like accounting
+MEMORY_GUARD_ACCOUNTING=auto
 
 # Per-node memory limit in GB used by the guard.
 # The master script resolves the effective node limit conservatively using the

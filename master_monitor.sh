@@ -134,8 +134,8 @@ MEM_CSV="${CONFIG_DIR}/memdiag_job${SLURM_JOB_ID}.csv"
 # Monitoring log file
 MONITOR_LOG="${CONFIG_DIR}/monitor.log.${SLURM_JOB_ID}"
 
-RESTART_READY_FILE="${CONFIG_DIR}/.restart_ready"
-SIM_DONE_FILE="${CONFIG_DIR}/.sim_done"
+RESTART_READY_FILE="${CONFIG_DIR}/.${CONFIG_BASE}.restart_ready"
+SIM_DONE_FILE="${CONFIG_DIR}/.${CONFIG_BASE}.sim_done"
 
 HARD_CUTOFF_SECONDS="${HARD_CUTOFF_SECONDS:-600}"
 SAFETY_FACTOR="${SAFETY_FACTOR:-1.2}"
@@ -155,6 +155,11 @@ MEMORY_GUARD_LOOKAHEAD_INTERVALS="${MEMORY_GUARD_LOOKAHEAD_INTERVALS:-2}"
 #   core = compare task MaxRSS against its physical-core memory share
 #   cpu = compare task MaxRSS against its logical-CPU memory share
 MEMORY_GUARD_SCOPE="${MEMORY_GUARD_SCOPE:-auto}"
+# Accounting policy for task-scoped MaxRSS:
+#   auto          = follow MEMORY_GUARD_SCOPE/site policy
+#   physical-core = divide node memory by physical cores (ARCHER2-like)
+#   logical-cpu   = divide node memory by Slurm logical CPUs (Anvil/Stampede3-like)
+MEMORY_GUARD_ACCOUNTING="${MEMORY_GUARD_ACCOUNTING:-auto}"
 
 # Fraction of the per-node memory limit at which we trigger.
 # 1.0 means "at the limit"; 0.95 means "95% of the limit".
@@ -174,6 +179,9 @@ MEMORY_GUARD_PERSISTENCE_SAMPLES="${MEMORY_GUARD_PERSISTENCE_SAMPLES:-2}"
 
 # Compute the slope from up to the last N samples.
 MEMORY_RATE_WINDOW="${MEMORY_RATE_WINDOW:-4}"
+END_SHUTDOWN_GRACE_SECONDS="${END_SHUTDOWN_GRACE_SECONDS:-300}"
+MPI_TERMINATION_GRACE_SECONDS="${MPI_TERMINATION_GRACE_SECONDS:-30}"
+EMERGENCY_HANDOFF_DEADLINE_SECONDS="${EMERGENCY_HANDOFF_DEADLINE_SECONDS:-45}"
 
 # When looking at the output log for elapsed time per step, consider a rolling
 # average over this many previous steps.
@@ -197,8 +205,18 @@ WALL_TIME_STR=$(
     ' "${CONFIG_ABS}"
 )
 
-if [[ -z "${WALL_TIME_STR}" ]]; then
-    echo "[ERROR] Could not parse wall-time from ${CONFIG_ABS}" >&2
+LIVE_WALL_TIME_STR=$(
+    scontrol show job -o "${SLURM_JOB_ID}" 2>/dev/null \
+        | tr ' ' '\n' \
+        | awk -F= '$1=="TimeLimit"{print $2; exit}'
+)
+if [[ -n "${LIVE_WALL_TIME_STR}" && "${LIVE_WALL_TIME_STR}" != "UNLIMITED" ]]; then
+    WALL_TIME_STR="${LIVE_WALL_TIME_STR}"
+    WALL_TIME_SOURCE="slurm-live"
+elif [[ -n "${WALL_TIME_STR}" ]]; then
+    WALL_TIME_SOURCE="script"
+else
+    echo "[ERROR] Could not resolve wall-time from Slurm or ${CONFIG_ABS}" >&2
     exit 1
 fi
 
@@ -211,16 +229,22 @@ OUTPUT_LOG_PATTERN=$(
     ' "${CONFIG_ABS}"
 )
 
-if [[ -z "${OUTPUT_LOG_PATTERN}" ]]; then
-    echo "[ERROR] Could not parse stdout output pattern from ${CONFIG_ABS}" >&2
+LIVE_OUTPUT_LOG=$(
+    scontrol show job -o "${SLURM_JOB_ID}" 2>/dev/null \
+        | tr ' ' '\n' \
+        | awk -F= '$1=="StdOut"{print $2; exit}'
+)
+if [[ -n "${LIVE_OUTPUT_LOG}" && "${LIVE_OUTPUT_LOG}" != "(null)" ]]; then
+    OUTPUT_LOG="${LIVE_OUTPUT_LOG}"
+elif [[ -n "${OUTPUT_LOG_PATTERN}" ]]; then
+    OUTPUT_LOG="${OUTPUT_LOG_PATTERN//%j/${SLURM_JOB_ID}}"
+    OUTPUT_LOG="${OUTPUT_LOG//%J/${SLURM_JOB_ID}}"
+    if [[ "${OUTPUT_LOG}" != /* ]]; then
+        OUTPUT_LOG="${CONFIG_DIR}/${OUTPUT_LOG}"
+    fi
+else
+    echo "[ERROR] Could not resolve stdout path from Slurm or ${CONFIG_ABS}" >&2
     exit 1
-fi
-
-OUTPUT_LOG="${OUTPUT_LOG_PATTERN//%j/${SLURM_JOB_ID}}"
-OUTPUT_LOG="${OUTPUT_LOG//%J/${SLURM_JOB_ID}}"
-
-if [[ "${OUTPUT_LOG}" != /* ]]; then
-    OUTPUT_LOG="${CONFIG_DIR}/${OUTPUT_LOG}"
 fi
 
 # ==============================================================================
@@ -901,10 +925,45 @@ get_node_physical_cores_count() {
     echo $(( cpu_total / threads_per_core ))
 }
 
+get_node_threads_per_core_count() {
+    local node="$1"
+    local threads_per_core
+    threads_per_core="$(get_node_topology_value "${node}" "ThreadsPerCore")"
+    [[ "${threads_per_core}" =~ ^[0-9]+$ ]] && [[ "${threads_per_core}" -gt 0 ]] || return 1
+    echo "${threads_per_core}"
+}
+
+get_memory_units_per_task() {
+    local scope="$1"
+    local cpus_per_task="$2"
+    local threads_per_core="$3"
+
+    [[ "${cpus_per_task}" =~ ^[0-9]+$ ]] && [[ "${cpus_per_task}" -gt 0 ]] || return 1
+    if [[ "${scope}" == "core" ]]; then
+        [[ "${threads_per_core}" =~ ^[0-9]+$ ]] && [[ "${threads_per_core}" -gt 0 ]] || return 1
+        echo $(( (cpus_per_task + threads_per_core - 1) / threads_per_core ))
+    else
+        echo "${cpus_per_task}"
+    fi
+}
+
 get_job_reqmem_raw() {
     scontrol show job -o "${SLURM_JOB_ID}" 2>/dev/null \
         | tr ' ' '\n' \
         | awk -F= '$1=="ReqMem"{print $2; exit}'
+}
+
+get_live_job_time_left_seconds() {
+    local job_data runtime_str limit_str runtime_seconds limit_seconds
+
+    job_data="$(scontrol show job -o "${SLURM_JOB_ID}" 2>/dev/null)" || return 1
+    runtime_str="$(tr ' ' '\n' <<< "${job_data}" | awk -F= '$1=="RunTime"{print $2; exit}')"
+    limit_str="$(tr ' ' '\n' <<< "${job_data}" | awk -F= '$1=="TimeLimit"{print $2; exit}')"
+    [[ -n "${runtime_str}" && -n "${limit_str}" && "${limit_str}" != "UNLIMITED" ]] || return 1
+
+    runtime_seconds="$(parse_slurm_time_to_seconds "${runtime_str}")" || return 1
+    limit_seconds="$(parse_slurm_time_to_seconds "${limit_str}")" || return 1
+    echo $(( limit_seconds - runtime_seconds ))
 }
 
 get_job_reqmem_kb_per_node() {
@@ -1010,7 +1069,10 @@ get_recent_logged_elapsed_step_average() {
             /Elapsed time is/ {
                 for (i=1; i<=NF; i++) {
                     if ($i == "is" && (i+1) <= NF) {
-                        vals[++n] = $(i+1)
+                        value = $(i+1)
+                        if (value ~ /^[0-9]+([.][0-9]+)?([Ee][+-]?[0-9]+)?$/ && value + 0 > 0) {
+                            vals[++n] = value + 0
+                        }
                         break
                     }
                 }
@@ -1030,6 +1092,162 @@ get_recent_logged_elapsed_step_average() {
     [[ -n "${avg}" ]] || return 1
     [[ "${avg}" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
     echo "${avg}"
+}
+
+normalize_fortran_real() {
+    local value="$1"
+    awk -v value="${value}" '
+        BEGIN {
+            gsub(/[dD]/, "E", value)
+            if (value !~ /^[+-]?([0-9]+([.][0-9]*)?|[.][0-9]+)([Ee][+-]?[0-9]+)?$/) {
+                exit 1
+            }
+            printf "%.17g\n", value + 0
+        }
+    '
+}
+
+next_common_dump_after() {
+    local current_tidx="$1"
+    local primary_start="$2"
+    local primary_interval="$3"
+    local precursor_start="$4"
+    local precursor_interval="$5"
+
+    awk \
+        -v current="${current_tidx}" \
+        -v a="${primary_start}" \
+        -v m="${primary_interval}" \
+        -v b="${precursor_start}" \
+        -v n="${precursor_interval}" '
+        function abs(x) { return x < 0 ? -x : x }
+        function gcd(x, y, t) {
+            x = abs(x); y = abs(y)
+            while (y != 0) { t = x % y; x = y; y = t }
+            return x
+        }
+        function mod(x, y) {
+            x %= y
+            return x < 0 ? x + y : x
+        }
+        function inverse(x, modulus, old_r, r, old_s, s, q, tmp) {
+            old_r = x; r = modulus
+            old_s = 1; s = 0
+            while (r != 0) {
+                q = int(old_r / r)
+                tmp = old_r - q * r; old_r = r; r = tmp
+                tmp = old_s - q * s; old_s = s; s = tmp
+            }
+            if (old_r != 1) return -1
+            return mod(old_s, modulus)
+        }
+        BEGIN {
+            if (current < 0 || a < 0 || b < 0 || m <= 0 || n <= 0) exit 1
+
+            g = gcd(m, n)
+            diff = b - a
+            if (diff % g != 0) exit 2
+
+            reduced_n = n / g
+            if (reduced_n == 1) {
+                k = 0
+            } else {
+                inv = inverse(mod(m / g, reduced_n), reduced_n)
+                if (inv < 0) exit 2
+                k = mod((diff / g) * inv, reduced_n)
+            }
+
+            first = a + m * k
+            period = (m / g) * n
+            if (first <= current) {
+                jumps = int((current - first) / period) + 1
+                first += jumps * period
+            }
+            printf "%.0f\n", first
+        }
+    '
+}
+
+get_latest_sim_end_estimate() {
+    local logfile="$1"
+    local target_tidx="$2"
+    local stop_time="$3"
+    local tail_lines
+
+    [[ -f "${logfile}" ]] || return 1
+    [[ "${target_tidx}" =~ ^[0-9]+$ ]] || return 1
+
+    tail_lines=$(( ELAPSED_STEP_WINDOW * 120 ))
+    [[ "${tail_lines}" -ge 300 ]] || tail_lines=300
+
+    tail -n "${tail_lines}" "${logfile}" 2>/dev/null \
+        | awk -v target="${target_tidx}" -v stop="${stop_time}" '
+            function number(s, normalized) {
+                normalized = s
+                gsub(/[dD]/, "E", normalized)
+                if (normalized !~ /^[+-]?([0-9]+([.][0-9]*)?|[.][0-9]+)([Ee][+-]?[0-9]+)?$/) {
+                    return ""
+                }
+                return normalized + 0
+            }
+            /Primary Simulation Info/ {
+                domain = "primary"
+                current_time = ""
+                current_tidx = ""
+                have_time = 0
+                next
+            }
+            /Concurrent Simulation Info|Precursor Simulation Info/ {
+                domain = "precursor"
+                current_time = ""
+                current_tidx = ""
+                have_time = 0
+                next
+            }
+            /> Time[[:space:]]*=/ {
+                current_time = number($NF)
+                have_time = (current_time != "")
+                next
+            }
+            /TIDX:[[:space:]]*=/ {
+                current_tidx = $NF
+                gsub(/[^0-9]/, "", current_tidx)
+                next
+            }
+            /Current dt:[[:space:]]*=/ {
+                dt = number($NF)
+                if (domain == "" || !have_time || current_tidx != target || dt == "" || dt <= 0) {
+                    next
+                }
+
+                remaining = stop - current_time
+                frames = 0
+                if (remaining > 0) {
+                    exact = remaining / dt
+                    frames = int(exact)
+                    if (frames < exact) frames++
+                }
+
+                domain_frames[domain] = frames
+                domain_time[domain] = current_time
+                domain_dt[domain] = dt
+                seen[domain] = 1
+            }
+            END {
+                for (name in seen) {
+                    records++
+                    frames = domain_frames[name]
+                    if (!have_max || frames > max_frames) {
+                        have_max = 1
+                        max_frames = frames
+                        max_time = domain_time[name]
+                        max_dt = domain_dt[name]
+                    }
+                }
+                if (!have_max) exit 1
+                printf "%d %.17g %.17g %d\n", max_frames, max_time, max_dt, records
+            }
+        '
 }
 
 push_mem_sample() {
@@ -1197,6 +1415,88 @@ get_file_mtime_epoch() {
     fi
 }
 
+MPI_WAIT_STATUS=""
+
+mpi_launcher_running() {
+    local state
+    kill -0 "${MPI_PID}" 2>/dev/null || return 1
+    state="$(ps -o stat= -p "${MPI_PID}" 2>/dev/null | awk '{print substr($1,1,1)}')"
+    [[ "${state}" != "Z" ]]
+}
+
+terminate_mpi_launcher() {
+    local reason="${1:-requested shutdown}"
+    local waited=0
+
+    [[ -n "${MPI_PID:-}" && "${MPI_PID}" =~ ^[0-9]+$ ]] || return 0
+    if ! mpi_launcher_running; then
+        if wait "${MPI_PID}" 2>/dev/null; then
+            MPI_WAIT_STATUS=0
+        else
+            MPI_WAIT_STATUS=$?
+        fi
+        return 0
+    fi
+
+    mlog "[MPI] Sending TERM to launcher PID=${MPI_PID} (${reason})."
+    kill -TERM "${MPI_PID}" 2>/dev/null || true
+    while mpi_launcher_running && \
+          [[ "${waited}" -lt "${MPI_TERMINATION_GRACE_SECONDS}" ]]; do
+        sleep 1
+        waited=$(( waited + 1 ))
+    done
+
+    if mpi_launcher_running; then
+        mlog "[MPI] Launcher still active after ${waited}s; sending KILL."
+        kill -KILL "${MPI_PID}" 2>/dev/null || true
+        sleep 1
+        if mpi_launcher_running; then
+            mlog "[MPI] Launcher remains active after KILL; refusing an unbounded wait."
+            MPI_WAIT_STATUS=137
+            return 1
+        fi
+    fi
+
+    if wait "${MPI_PID}" 2>/dev/null; then
+        MPI_WAIT_STATUS=0
+    else
+        MPI_WAIT_STATUS=$?
+    fi
+}
+
+get_latest_logged_tidx() {
+    local logfile="$1"
+    local tail_lines
+    [[ -f "${logfile}" ]] || return 1
+    tail_lines=$(( ELAPSED_STEP_WINDOW * 120 ))
+    [[ "${tail_lines}" -ge 600 ]] || tail_lines=600
+    tail -n "${tail_lines}" "${logfile}" 2>/dev/null \
+        | awk '/TIDX:[[:space:]]*=/ { value=$NF } END { if (value ~ /^[0-9]+$/) print value; else exit 1 }'
+}
+
+should_write_sim_done() {
+    local mpi_exit="$1"
+    local end_reached="$2"
+    local shutdown_forced="$3"
+    [[ "${mpi_exit}" -eq 0 && "${end_reached}" -eq 1 && "${shutdown_forced}" -eq 0 ]]
+}
+
+get_end_shutdown_action() {
+    local memory_hard_stop="$1"
+    local waited="$2"
+    local grace="$3"
+    local time_left="$4"
+    local hard_cutoff="$5"
+
+    if [[ "${memory_hard_stop}" -eq 1 ]]; then
+        echo "terminate-memory"
+    elif [[ "${waited}" -ge "${grace}" || "${time_left}" -le "${hard_cutoff}" ]]; then
+        echo "terminate-time"
+    else
+        echo "wait"
+    fi
+}
+
 submit_from_config() {
     local dependency_mode="${1:-none}"
     local dependency_jobid="${2:-}"
@@ -1221,7 +1521,7 @@ submit_with_retry() {
         rc=$?
 
         if [[ "${rc}" -eq 0 ]]; then
-            echo "${out}"
+            echo "${out%%;*}"
             return 0
         fi
 
@@ -1250,15 +1550,11 @@ stage_restart_handoff_and_exit() {
 
     sync || true
 
-    if [[ -n "${MPI_PID:-}" ]] && kill -0 "${MPI_PID}" 2>/dev/null; then
-        mlog "[Handoff] Terminating MPI PID ${MPI_PID}."
-        kill -TERM "${MPI_PID}" 2>/dev/null || true
-        wait "${MPI_PID}" 2>/dev/null || true
-    fi
+    terminate_mpi_launcher "staged handoff"
 
     release_restart_lock
-    mlog "[Handoff] Exiting current job to allow dependent child to continue."
-    exit 0
+    mlog "[Handoff] No child was submitted by this script; external recovery is required."
+    exit 1
 }
 
 parse_namelist_value() {
@@ -1317,11 +1613,17 @@ set_namelist_value() {
         return ${awk_exit}
     fi
 
+    cp --attributes-only --preserve=all "${file}" "${tmpfile}" 2>/dev/null || \
+        chmod --reference="${file}" "${tmpfile}" || {
+            rm -f "${tmpfile}"
+            return 1
+        }
     mv "${tmpfile}" "${file}"
 }
 
 latest_common_restart_tid() {
     local dir1="$1" rid1="$2" dir2="$3" rid2="$4"
+    local max_tidx="${5:-}"
     local list1 list2
 
     list1=$(find "${dir1}" -maxdepth 1 -type f \
@@ -1343,7 +1645,10 @@ latest_common_restart_tid() {
         return 0
     fi
 
-    comm -12 <(echo "${list1}" | sort) <(echo "${list2}" | sort) | sort -n | tail -1
+    comm -12 <(echo "${list1}" | sort) <(echo "${list2}" | sort) \
+        | awk -v max="${max_tidx}" 'max == "" || $1 <= max' \
+        | sort -n \
+        | tail -1
 }
 
 validate_nonempty() {
@@ -1360,20 +1665,111 @@ validate_integer() {
     fi
 }
 
-acquire_restart_lock() {
-    if ( set -o noclobber; > "${RESTART_LOCKFILE}" ) 2>/dev/null; then
-        echo "${SLURM_JOB_ID} $$ $(date '+%F %T')" > "${RESTART_LOCKFILE}"
+RESTART_LOCK_OWNED=0
+RESTART_LOCK_TOKEN=""
+
+restart_lock_owner_active() {
+    local owner_job="$1"
+    local owner_pid="$2"
+    local owner_host="$3"
+    local state rc
+
+    if [[ "${owner_host}" == "$(hostname)" && "${owner_pid}" =~ ^[0-9]+$ ]] && \
+       kill -0 "${owner_pid}" 2>/dev/null; then
         return 0
     fi
+
+    if [[ "${owner_job}" =~ ^[0-9]+$ ]]; then
+        if command -v squeue >/dev/null 2>&1; then
+            state="$(squeue -h -j "${owner_job}" -o '%T' 2>/dev/null)"
+            rc=$?
+            [[ "${rc}" -ne 0 ]] && return 0
+            state="${state%%$'\n'*}"
+            [[ -n "${state}" ]] && return 0
+        elif command -v scontrol >/dev/null 2>&1; then
+            scontrol show job "${owner_job}" >/dev/null 2>&1
+            rc=$?
+            [[ "${rc}" -eq 0 ]] && return 0
+        else
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+acquire_restart_lock() {
+    local owner_file="${RESTART_LOCKFILE}/owner"
+    local owner_job="" owner_pid="" owner_host="" owner_token=""
+
+    RESTART_LOCK_TOKEN="${SLURM_JOB_ID}:$$:$(hostname):$(date +%s)"
+
+    if mkdir "${RESTART_LOCKFILE}" 2>/dev/null; then
+        printf '%s %s %s %s\n' \
+            "${SLURM_JOB_ID}" "$$" "$(hostname)" "${RESTART_LOCK_TOKEN}" \
+            > "${owner_file}"
+        RESTART_LOCK_OWNED=1
+        return 0
+    fi
+
+    if [[ -f "${RESTART_LOCKFILE}" ]]; then
+        read -r owner_job owner_pid _ < "${RESTART_LOCKFILE}" || true
+        if restart_lock_owner_active "${owner_job}" "${owner_pid}" "$(hostname)"; then
+            return 1
+        fi
+        mlog "[Lock] Removing stale legacy restart-lock file."
+        rm -f "${RESTART_LOCKFILE}" 2>/dev/null || return 1
+    elif [[ -r "${owner_file}" ]]; then
+        read -r owner_job owner_pid owner_host owner_token < "${owner_file}" || true
+        if restart_lock_owner_active "${owner_job}" "${owner_pid}" "${owner_host}"; then
+            return 1
+        fi
+        mlog "[Lock] Recovering stale restart lock owned by job=${owner_job:-unknown} pid=${owner_pid:-unknown} host=${owner_host:-unknown}."
+        local stale_lock="${RESTART_LOCKFILE}.stale.${SLURM_JOB_ID}.$$.$RANDOM"
+        mv "${RESTART_LOCKFILE}" "${stale_lock}" 2>/dev/null || return 1
+        rm -rf "${stale_lock}" 2>/dev/null || true
+    elif [[ -d "${RESTART_LOCKFILE}" ]]; then
+        mlog "[Lock] Restart lock has no readable owner metadata; refusing unsafe takeover."
+        return 1
+    else
+        return 1
+    fi
+
+    if mkdir "${RESTART_LOCKFILE}" 2>/dev/null; then
+        printf '%s %s %s %s\n' \
+            "${SLURM_JOB_ID}" "$$" "$(hostname)" "${RESTART_LOCK_TOKEN}" \
+            > "${owner_file}"
+        RESTART_LOCK_OWNED=1
+        return 0
+    fi
+
     return 1
 }
 
 release_restart_lock() {
-    rm -f "${RESTART_LOCKFILE}" 2>/dev/null || true
+    local owner_file="${RESTART_LOCKFILE}/owner"
+    local owner_job="" owner_pid="" owner_host="" owner_token=""
+
+    [[ "${RESTART_LOCK_OWNED}" -eq 1 ]] || return 0
+    if [[ -r "${owner_file}" ]]; then
+        read -r owner_job owner_pid owner_host owner_token < "${owner_file}" || true
+    fi
+    if [[ "${owner_token}" == "${RESTART_LOCK_TOKEN}" ]]; then
+        rm -f "${owner_file}" 2>/dev/null || true
+        rmdir "${RESTART_LOCKFILE}" 2>/dev/null || true
+    else
+        mlog "[Lock] Refusing to release restart lock not owned by this process."
+    fi
+    RESTART_LOCK_OWNED=0
+    RESTART_LOCK_TOKEN=""
 }
 
 cleanup_watchers() {
-    : # no background watchers in the unified design; kept for EXIT trap symmetry
+    if [[ "${INPUT_UPDATE_IN_PROGRESS:-0}" -eq 1 ]]; then
+        mlog "[Cleanup] Interrupted input update detected; restoring backups."
+        _restore_input_files
+    fi
+    release_restart_lock
 }
 
 validate_integer "${ESTIMATE_PERSISTENCE_SAMPLES}" "ESTIMATE_PERSISTENCE_SAMPLES"
@@ -1382,10 +1778,21 @@ validate_integer "${MEMORY_GUARD_PERSISTENCE_SAMPLES}" "MEMORY_GUARD_PERSISTENCE
 validate_integer "${MEMORY_RATE_WINDOW}" "MEMORY_RATE_WINDOW"
 validate_integer "${ELAPSED_STEP_WINDOW}" "ELAPSED_STEP_WINDOW"
 validate_integer "${STACK_DUMP_GDB_TIMEOUT_SECONDS}" "STACK_DUMP_GDB_TIMEOUT_SECONDS"
+validate_integer "${MONITOR_INTERVAL}" "MONITOR_INTERVAL"
+validate_integer "${FROZEN_TIMEOUT_SECONDS}" "FROZEN_TIMEOUT_SECONDS"
+validate_integer "${END_SHUTDOWN_GRACE_SECONDS}" "END_SHUTDOWN_GRACE_SECONDS"
+validate_integer "${MPI_TERMINATION_GRACE_SECONDS}" "MPI_TERMINATION_GRACE_SECONDS"
+validate_integer "${EMERGENCY_HANDOFF_DEADLINE_SECONDS}" "EMERGENCY_HANDOFF_DEADLINE_SECONDS"
 
 [[ "${ESTIMATE_PERSISTENCE_SAMPLES}" -gt 0 ]]   || { mlog "[ERROR] ESTIMATE_PERSISTENCE_SAMPLES must be > 0"; exit 1; }
 [[ "${STACK_DUMP_ENABLED}" =~ ^[01]$ ]] || { mlog "[ERROR] STACK_DUMP_ENABLED must be 0 or 1"; exit 1; }
+[[ "${MEMORY_GUARD_ENABLED}" =~ ^[01]$ ]] || { mlog "[ERROR] MEMORY_GUARD_ENABLED must be 0 or 1"; exit 1; }
 [[ "${STACK_DUMP_GDB_TIMEOUT_SECONDS}" -gt 0 ]] || { mlog "[ERROR] STACK_DUMP_GDB_TIMEOUT_SECONDS must be > 0"; exit 1; }
+[[ "${MONITOR_INTERVAL}" -gt 0 ]] || { mlog "[ERROR] MONITOR_INTERVAL must be > 0"; exit 1; }
+[[ "${FROZEN_TIMEOUT_SECONDS}" -gt 0 ]] || { mlog "[ERROR] FROZEN_TIMEOUT_SECONDS must be > 0"; exit 1; }
+[[ "${END_SHUTDOWN_GRACE_SECONDS}" -gt 0 ]] || { mlog "[ERROR] END_SHUTDOWN_GRACE_SECONDS must be > 0"; exit 1; }
+[[ "${MPI_TERMINATION_GRACE_SECONDS}" -gt 0 ]] || { mlog "[ERROR] MPI_TERMINATION_GRACE_SECONDS must be > 0"; exit 1; }
+[[ "${EMERGENCY_HANDOFF_DEADLINE_SECONDS}" -gt 0 ]] || { mlog "[ERROR] EMERGENCY_HANDOFF_DEADLINE_SECONDS must be > 0"; exit 1; }
 
 [[ "${HARD_CUTOFF_SECONDS}" =~ ^[0-9]+$ ]]          || { mlog "[ERROR] HARD_CUTOFF_SECONDS must be an integer"; exit 1; }
 [[ "${SAFETY_FACTOR}" =~ ^[0-9]+([.][0-9]+)?$ ]]    || { mlog "[ERROR] SAFETY_FACTOR must be a number"; exit 1; }
@@ -1401,6 +1808,10 @@ HARD_STOP_CHECK=$(echo "${MEMORY_GUARD_HARD_STOP_FRAC} > 0 && ${MEMORY_GUARD_HAR
 case "${MEMORY_GUARD_SCOPE}" in
     auto|node|core|cpu) ;;
     *) mlog "[ERROR] MEMORY_GUARD_SCOPE must be one of: auto, node, core, cpu"; exit 1 ;;
+esac
+case "${MEMORY_GUARD_ACCOUNTING}" in
+    auto|physical-core|logical-cpu) ;;
+    *) mlog "[ERROR] MEMORY_GUARD_ACCOUNTING must be one of: auto, physical-core, logical-cpu"; exit 1 ;;
 esac
 [[ "${MEMORY_GUARD_UTILIZATION}" =~ ^[0-9]+([.][0-9]+)?$ ]] || { mlog "[ERROR] MEMORY_GUARD_UTILIZATION must be a positive number"; exit 1; }
 UTIL_RANGE_CHECK=$(echo \
@@ -1430,7 +1841,9 @@ MEMORY_GUARD_SCOPE_RESOLVED="node"
 MEMORY_GUARD_SCOPE_SOURCE="disabled"
 MEMORY_GUARD_CPUS_PER_NODE=0
 MEMORY_GUARD_CORES_PER_NODE=0
+MEMORY_GUARD_THREADS_PER_CORE=0
 MEMORY_GUARD_DIVISOR_PER_NODE=0
+MEMORY_GUARD_UNITS_PER_TASK=0
 MEMORY_GUARD_TASKS_PER_NODE=0
 
 if [[ "${MEMORY_GUARD_ENABLED}" -eq 1 ]]; then
@@ -1464,6 +1877,7 @@ if [[ "${MEMORY_GUARD_ENABLED}" -eq 1 ]]; then
         SLURM_NODE_LIMIT_KB="$(get_node_realmemory_kb "${FIRST_NODE}" || echo 0)"
         MEMORY_GUARD_CPUS_PER_NODE="$(get_node_logical_cpus_count "${FIRST_NODE}" || echo 0)"
         MEMORY_GUARD_CORES_PER_NODE="$(get_node_physical_cores_count "${FIRST_NODE}" || echo 0)"
+        MEMORY_GUARD_THREADS_PER_CORE="$(get_node_threads_per_core_count "${FIRST_NODE}" || echo 0)"
     fi
 
     SLURM_REQMEM_NODE_KB="$(get_job_reqmem_kb_per_node || echo 0)"
@@ -1478,6 +1892,17 @@ if [[ "${MEMORY_GUARD_ENABLED}" -eq 1 ]]; then
         MEMORY_GUARD_SCOPE_SOURCE="site-policy"
         MEMORY_GUARD_EFFECTIVE_LIMIT_KB="${MEMORY_GUARD_NODE_LIMIT_RESOLVED_KB}"
     fi
+
+    case "${MEMORY_GUARD_ACCOUNTING}" in
+        physical-core)
+            MEMORY_GUARD_SCOPE_RESOLVED="core"
+            MEMORY_GUARD_SCOPE_SOURCE="accounting-override"
+            ;;
+        logical-cpu)
+            MEMORY_GUARD_SCOPE_RESOLVED="cpu"
+            MEMORY_GUARD_SCOPE_SOURCE="accounting-override"
+            ;;
+    esac
 
     if [[ "${MEMORY_GUARD_EFFECTIVE_LIMIT_KB}" =~ ^[0-9]+$ ]] && \
        [[ "${MEMORY_GUARD_EFFECTIVE_LIMIT_KB}" -gt 0 ]]; then
@@ -1500,11 +1925,22 @@ if [[ "${MEMORY_GUARD_ENABLED}" -eq 1 ]]; then
                [[ "${MEMORY_GUARD_DIVISOR_PER_NODE}" -gt 0 ]]; then
                 CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-1}"
                 [[ "${CPUS_PER_TASK}" =~ ^[0-9]+$ ]] || CPUS_PER_TASK=1
+                if [[ "${MEMORY_GUARD_SCOPE_RESOLVED}" == "core" ]]; then
+                    if [[ "${MEMORY_GUARD_THREADS_PER_CORE}" -gt 0 ]]; then
+                        MEMORY_GUARD_UNITS_PER_TASK="$(get_memory_units_per_task \
+                            core "${CPUS_PER_TASK}" "${MEMORY_GUARD_THREADS_PER_CORE}")"
+                    else
+                        MEMORY_GUARD_UNITS_PER_TASK="${CPUS_PER_TASK}"
+                    fi
+                else
+                    MEMORY_GUARD_UNITS_PER_TASK="$(get_memory_units_per_task \
+                        cpu "${CPUS_PER_TASK}" 1)"
+                fi
                 MEMORY_GUARD_COMPARE_LIMIT_KB=$(awk \
                     -v lim="${MEMORY_GUARD_EFFECTIVE_LIMIT_KB}" \
                     -v units_per_node="${MEMORY_GUARD_DIVISOR_PER_NODE}" \
-                    -v cpus_per_task="${CPUS_PER_TASK}" \
-                    'BEGIN { printf "%.0f\n", lim / units_per_node * cpus_per_task }')
+                    -v units_per_task="${MEMORY_GUARD_UNITS_PER_TASK}" \
+                    'BEGIN { printf "%.0f\n", lim / units_per_node * units_per_task }')
             else
                 MEMORY_GUARD_SCOPE_RESOLVED="node"
                 MEMORY_GUARD_SCOPE_SOURCE="fallback-node"
@@ -1554,9 +1990,34 @@ validate_nonempty "${PRECURSOR_INPUTDIR}" "precursor inputdir"
 [[ -d "${PRIMARY_INPUTDIR}" ]]   || { mlog "[ERROR] Primary inputdir not found: ${PRIMARY_INPUTDIR}"; exit 1; }
 [[ -d "${PRECURSOR_INPUTDIR}" ]] || { mlog "[ERROR] Precursor inputdir not found: ${PRECURSOR_INPUTDIR}"; exit 1; }
 
-T_RESTART_DUMP=$(parse_namelist_value "${PRIMARY_INPUTFILE}" "t_restartDump")
-validate_nonempty "${T_RESTART_DUMP}" "t_restartDump"
-validate_integer  "${T_RESTART_DUMP}" "t_restartDump"
+PRIMARY_T_RESTART_DUMP=$(parse_namelist_value "${PRIMARY_INPUTFILE}" "t_restartDump")
+PRECURSOR_T_RESTART_DUMP=$(parse_namelist_value "${PRECURSOR_INPUTFILE}" "t_restartDump")
+validate_nonempty "${PRIMARY_T_RESTART_DUMP}" "primary t_restartDump"
+validate_nonempty "${PRECURSOR_T_RESTART_DUMP}" "precursor t_restartDump"
+validate_integer  "${PRIMARY_T_RESTART_DUMP}" "primary t_restartDump"
+validate_integer  "${PRECURSOR_T_RESTART_DUMP}" "precursor t_restartDump"
+[[ "${PRIMARY_T_RESTART_DUMP}" -gt 0 ]] || { mlog "[ERROR] Primary t_restartDump must be > 0"; exit 1; }
+[[ "${PRECURSOR_T_RESTART_DUMP}" -gt 0 ]] || { mlog "[ERROR] Precursor t_restartDump must be > 0"; exit 1; }
+
+PRIMARY_RESTART_TID=$(parse_namelist_value "${PRIMARY_INPUTFILE}" "restartFile_TID")
+PRECURSOR_RESTART_TID=$(parse_namelist_value "${PRECURSOR_INPUTFILE}" "restartFile_TID")
+validate_nonempty "${PRIMARY_RESTART_TID}" "primary restartFile_TID"
+validate_nonempty "${PRECURSOR_RESTART_TID}" "precursor restartFile_TID"
+validate_integer "${PRIMARY_RESTART_TID}" "primary restartFile_TID"
+validate_integer "${PRECURSOR_RESTART_TID}" "precursor restartFile_TID"
+
+PRIMARY_TSTOP_RAW=$(parse_namelist_value "${PRIMARY_INPUTFILE}" "tstop")
+PRECURSOR_TSTOP_RAW=$(parse_namelist_value "${PRECURSOR_INPUTFILE}" "tstop")
+PRIMARY_TSTOP=$(normalize_fortran_real "${PRIMARY_TSTOP_RAW}") || {
+    mlog "[ERROR] Invalid primary tstop='${PRIMARY_TSTOP_RAW}'"
+    exit 1
+}
+PRECURSOR_TSTOP=$(normalize_fortran_real "${PRECURSOR_TSTOP_RAW}") || {
+    mlog "[ERROR] Invalid precursor tstop='${PRECURSOR_TSTOP_RAW}'"
+    exit 1
+}
+SIMULATION_TSTOP=$(awk -v primary="${PRIMARY_TSTOP}" -v precursor="${PRECURSOR_TSTOP}" \
+    'BEGIN { print (primary < precursor) ? primary : precursor }')
 
 PRIMARY_RID_PAD=$(printf "%02d" "${PRIMARY_RUNID}")
 PRECURSOR_RID_PAD=$(printf "%02d" "${PRECURSOR_RUNID}")
@@ -1569,6 +2030,7 @@ mlog "Tasks total     : ${SLURM_NTASKS}"
 mlog "Tasks per node  : ${SLURM_TASKS_PER_NODE}"
 mlog "CPUs per task   : ${SLURM_CPUS_PER_TASK}"
 mlog "Wall time limit : ${WALL_TIME_STR}  (${WALL_TIME_SECONDS}s)"
+mlog "Wall time source: ${WALL_TIME_SOURCE}"
 mlog "Hard cutoff     : ${HARD_CUTOFF_SECONDS}s remaining"
 mlog "Frozen timeout  : ${FROZEN_TIMEOUT_SECONDS}s"
 mlog "Stack dump enabled  : ${STACK_DUMP_ENABLED}"
@@ -1587,9 +2049,16 @@ mlog "Mem user limit/node : ${MEMORY_GUARD_NODE_LIMIT_GB:-unset} GB (${USER_NODE
 mlog "Mem slurm real/node : ${SLURM_NODE_LIMIT_KB:-0} KB"
 mlog "Mem slurm req/node  : ${SLURM_REQMEM_NODE_KB:-0} KB"
 mlog "Mem scope       : ${MEMORY_GUARD_SCOPE_RESOLVED} (${MEMORY_GUARD_SCOPE_SOURCE})"
+mlog "Mem accounting  : ${MEMORY_GUARD_ACCOUNTING}"
+if [[ "${MEMORY_GUARD_SCOPE_RESOLVED}" == "node" || \
+      "${MEMORY_GUARD_SCOPE_RESOLVED}" == "cgroup" ]]; then
+    mlog "Mem scope warning: verify that sstat MaxRSS and the selected limit describe the same allocation scope."
+fi
 mlog "Mem cpus/node   : ${MEMORY_GUARD_CPUS_PER_NODE}"
 mlog "Mem cores/node  : ${MEMORY_GUARD_CORES_PER_NODE}"
+mlog "Mem threads/core: ${MEMORY_GUARD_THREADS_PER_CORE}"
 mlog "Mem divisor/node: ${MEMORY_GUARD_DIVISOR_PER_NODE}"
+mlog "Mem units/task  : ${MEMORY_GUARD_UNITS_PER_TASK}"
 mlog "Mem tasks/node   : ${MEMORY_GUARD_TASKS_PER_NODE}"
 mlog "Mem limit/node  : ${MEMORY_GUARD_NODE_LIMIT_RESOLVED_KB} KB"
 mlog "Mem limit/effective : ${MEMORY_GUARD_EFFECTIVE_LIMIT_KB} KB"
@@ -1603,7 +2072,11 @@ mlog "Primary input   : ${PRIMARY_INPUTFILE}"
 mlog "Precursor input : ${PRECURSOR_INPUTFILE}"
 mlog "Primary dir     : ${PRIMARY_INPUTDIR}"
 mlog "Precursor dir   : ${PRECURSOR_INPUTDIR}"
-mlog "t_restartDump   : ${T_RESTART_DUMP} steps"
+mlog "Primary restart cadence   : start=${PRIMARY_RESTART_TID}, every=${PRIMARY_T_RESTART_DUMP} steps"
+mlog "Precursor restart cadence : start=${PRECURSOR_RESTART_TID}, every=${PRECURSOR_T_RESTART_DUMP} steps"
+mlog "Primary tstop   : ${PRIMARY_TSTOP}"
+mlog "Precursor tstop : ${PRECURSOR_TSTOP}"
+mlog "Effective tstop : ${SIMULATION_TSTOP} (minimum)"
 mlog "Primary RunID   : ${PRIMARY_RUNID} (${PRIMARY_RID_PAD})"
 mlog "Precursor RunID : ${PRECURSOR_RUNID} (${PRECURSOR_RID_PAD})"
 mlog "Restart lock    : ${RESTART_LOCKFILE}"
@@ -1665,6 +2138,16 @@ get_budget_deficit_compact_field_count() {
     esac
 }
 
+deficit_term_set_complete() {
+    local actual_terms="$1"
+    local field_count="$2"
+    local zero_based one_based
+
+    zero_based="$(seq 0 $(( field_count - 1 )))"
+    one_based="$(seq 1 "${field_count}")"
+    [[ "${actual_terms}" == "${zero_based}" || "${actual_terms}" == "${one_based}" ]]
+}
+
 # Find ALL valid (tidx,counter) pairs for a deficit compact budget
 find_all_deficit_compact_budget_states() {
     local budget_dir="$1"
@@ -1672,8 +2155,9 @@ find_all_deficit_compact_budget_states() {
     local budget_num="$3"
     local max_tidx="$4"
     
-    local field_count=$(get_budget_deficit_compact_field_count "${budget_num}")
-    [[ "${field_count}" -eq 0 ]] && return 1
+    local field_count
+    field_count="$(get_budget_deficit_compact_field_count "${budget_num}")"
+    [[ "${field_count}" -gt 0 ]] || return 1
     
     local pattern="Run${rid_pad}_comp_deficit_budget${budget_num}_term*_t??????_n??????.s3D"
     
@@ -1687,24 +2171,33 @@ find_all_deficit_compact_budget_states() {
     
     # Find all complete (tidx,counter) pairs
     while IFS= read -r tidx; do
+        emergency_deadline_exceeded && return 2
         local tidx_num=$((10#${tidx}))
         
         # Safety: must be less than or equal to the latest simulation TIDX
         [[ "${tidx_num}" -gt "${max_tidx}" ]] && continue
         
-        # Count files for this TIDX
-        local file_count=$(find "${budget_dir}" -maxdepth 1 \
+        local counter_list
+        counter_list=$(find "${budget_dir}" -maxdepth 1 \
             -name "Run${rid_pad}_comp_deficit_budget${budget_num}_term??_t${tidx}_n??????.s3D" \
-            2>/dev/null | wc -l)
-        
-        if [[ "${file_count}" -eq "${field_count}" ]]; then
-            local counter=$(find "${budget_dir}" -maxdepth 1 \
-                -name "Run${rid_pad}_comp_deficit_budget${budget_num}_term*_t${tidx}_n??????.s3D" \
-                2>/dev/null | head -1 | sed 's/.*_n\([0-9]\{6\}\)\.s3D/\1/')
-            
-            local counter_num=$((10#${counter}))
-            echo "${tidx_num},${counter_num}"
-        fi
+            2>/dev/null \
+            | sed 's/.*_n\([0-9]\{6\}\)\.s3D/\1/' \
+            | sort -u)
+
+        while IFS= read -r counter; do
+            emergency_deadline_exceeded && return 2
+            [[ "${counter}" =~ ^[0-9]{6}$ ]] || continue
+            local actual_terms
+            actual_terms=$(find "${budget_dir}" -maxdepth 1 \
+                -name "Run${rid_pad}_comp_deficit_budget${budget_num}_term??_t${tidx}_n${counter}.s3D" \
+                2>/dev/null \
+                | sed 's/.*_term\([0-9][0-9]\)_t.*/\1/' \
+                | awk '{ print $1 + 0 }' \
+                | sort -n -u)
+            if deficit_term_set_complete "${actual_terms}" "${field_count}"; then
+                echo "${tidx_num},$((10#${counter}))"
+            fi
+        done <<< "${counter_list}"
     done <<< "${tidx_list}"
 }
 
@@ -1728,30 +2221,37 @@ find_all_time_avg_budget_states() {
         [[ -z "${tidx_list}" ]] && return 1
         
         while IFS= read -r tidx; do
+            emergency_deadline_exceeded && return 2
             local tidx_num=$((10#${tidx}))
             
             [[ "${tidx_num}" -gt "${max_tidx}" ]] && continue
             
-            local all_present=1
-            for term in ${required_terms}; do
-                local term_pad=$(printf "%02d" "${term}")
-                local file_pattern="Run${rid_pad}_budget0_term${term_pad}_t${tidx}_n??????.s3D"
-                local file_count=$(find "${budget_dir}" -maxdepth 1 -name "${file_pattern}" 2>/dev/null | wc -l)
-                
-                if [[ "${file_count}" -eq 0 ]]; then
-                    all_present=0
-                    break
+            local counter_list
+            counter_list=$(find "${budget_dir}" -maxdepth 1 \
+                -name "Run${rid_pad}_budget0_term??_t${tidx}_n??????.s3D" \
+                2>/dev/null \
+                | sed 's/.*_n\([0-9]\{6\}\)\.s3D/\1/' \
+                | sort -u)
+
+            while IFS= read -r counter; do
+                emergency_deadline_exceeded && return 2
+                [[ "${counter}" =~ ^[0-9]{6}$ ]] || continue
+                local all_present=1
+                for term in ${required_terms}; do
+                    local term_pad
+                    term_pad=$(printf "%02d" "${term}")
+                    local file_pattern="Run${rid_pad}_budget0_term${term_pad}_t${tidx}_n${counter}.s3D"
+                    if ! find "${budget_dir}" -maxdepth 1 -name "${file_pattern}" -print -quit \
+                        2>/dev/null | grep -q .; then
+                        all_present=0
+                        break
+                    fi
+                done
+
+                if [[ "${all_present}" -eq 1 ]]; then
+                    echo "${tidx_num},$((10#${counter}))"
                 fi
-            done
-            
-            if [[ "${all_present}" -eq 1 ]]; then
-                local counter=$(find "${budget_dir}" -maxdepth 1 \
-                    -name "Run${rid_pad}_budget0_term??_t${tidx}_n??????.s3D" \
-                    2>/dev/null | head -1 | sed 's/.*_n\([0-9]\{6\}\)\.s3D/\1/')
-                
-                local counter_num=$((10#${counter}))
-                echo "${tidx_num},${counter_num}"
-            fi
+            done <<< "${counter_list}"
         done <<< "${tidx_list}"
     fi
 }
@@ -1863,6 +2363,11 @@ set_namelist_value_in_section() {
         return 1
     fi
     
+    cp --attributes-only --preserve=all "${file}" "${tmpfile}" 2>/dev/null || \
+        chmod --reference="${file}" "${tmpfile}" || {
+            rm -f "${tmpfile}"
+            return 1
+        }
     mv "${tmpfile}" "${file}"
 }
 
@@ -2109,16 +2614,51 @@ process_budget_restarts_for_file() {
     fi
 }
 
+INPUT_UPDATE_IN_PROGRESS=0
+PRIMARY_INPUT_STAGE=""
+PRECURSOR_INPUT_STAGE=""
+
+cleanup_input_stages() {
+    [[ -n "${PRIMARY_INPUT_STAGE}" ]] && rm -f "${PRIMARY_INPUT_STAGE}" 2>/dev/null || true
+    [[ -n "${PRECURSOR_INPUT_STAGE}" ]] && rm -f "${PRECURSOR_INPUT_STAGE}" 2>/dev/null || true
+    PRIMARY_INPUT_STAGE=""
+    PRECURSOR_INPUT_STAGE=""
+}
+
+commit_staged_input() {
+    local staged="$1"
+    local target="$2"
+    local commit_tmp="${target}.commit.$$"
+
+    cp --preserve=all "${staged}" "${commit_tmp}" || return 1
+    mv "${commit_tmp}" "${target}" || {
+        rm -f "${commit_tmp}" 2>/dev/null || true
+        return 1
+    }
+}
+
 _update_input_files() {
     local common_restart_tid="$1"
+    local primary_min_budget precursor_min_budget budget_ceiling final_restart_tid
 
     mlog "[Update] Ensuring original input backups exist (suffix: .bak_job${SLURM_JOB_ID})"
 
     [[ -f "${PRIMARY_INPUTFILE}.bak_job${SLURM_JOB_ID}" ]] || \
-        cp "${PRIMARY_INPUTFILE}" "${PRIMARY_INPUTFILE}.bak_job${SLURM_JOB_ID}" || return 1
+        cp --preserve=all "${PRIMARY_INPUTFILE}" "${PRIMARY_INPUTFILE}.bak_job${SLURM_JOB_ID}" || return 1
 
     [[ -f "${PRECURSOR_INPUTFILE}.bak_job${SLURM_JOB_ID}" ]] || \
-        cp "${PRECURSOR_INPUTFILE}" "${PRECURSOR_INPUTFILE}.bak_job${SLURM_JOB_ID}" || return 1
+        cp --preserve=all "${PRECURSOR_INPUTFILE}" "${PRECURSOR_INPUTFILE}.bak_job${SLURM_JOB_ID}" || return 1
+
+    INPUT_UPDATE_IN_PROGRESS=1
+    cleanup_input_stages
+    PRIMARY_INPUT_STAGE="$(mktemp "${PRIMARY_INPUTFILE}.stage.${SLURM_JOB_ID}.XXXXXX")" || return 1
+    PRECURSOR_INPUT_STAGE="$(mktemp "${PRECURSOR_INPUTFILE}.stage.${SLURM_JOB_ID}.XXXXXX")" || {
+        cleanup_input_stages
+        return 1
+    }
+    rm -f "${PRIMARY_INPUT_STAGE}" "${PRECURSOR_INPUT_STAGE}" || return 1
+    cp --preserve=all "${PRIMARY_INPUTFILE}" "${PRIMARY_INPUT_STAGE}" || return 1
+    cp --preserve=all "${PRECURSOR_INPUTFILE}" "${PRECURSOR_INPUT_STAGE}" || return 1
 
     mlog "================================================================"
     mlog "[Update] Phase 1: Finding restart constraints from all systems..."
@@ -2126,23 +2666,43 @@ _update_input_files() {
     mlog "[Update] Restart files: common TID=${common_restart_tid}"
     
     # PHASE 1: Discover budget constraints (but don't update files yet)
-    local primary_min_budget=$(process_budget_restarts_for_file \
-        "${PRIMARY_INPUTFILE}" "PRIMARY" "${PRIMARY_RUNID}" "${PRIMARY_RID_PAD}" "${common_restart_tid}" "discover")
+    primary_min_budget=$(process_budget_restarts_for_file \
+        "${PRIMARY_INPUT_STAGE}" "PRIMARY" "${PRIMARY_RUNID}" "${PRIMARY_RID_PAD}" "${common_restart_tid}" "discover")
+    emergency_deadline_exceeded && {
+        mlog "[Update] Emergency deadline reached during PRIMARY budget discovery."
+        cleanup_input_stages
+        return 2
+    }
     
-    local precursor_min_budget=$(process_budget_restarts_for_file \
-        "${PRECURSOR_INPUTFILE}" "PRECURSOR" "${PRECURSOR_RUNID}" "${PRECURSOR_RID_PAD}" "${common_restart_tid}" "discover")
+    precursor_min_budget=$(process_budget_restarts_for_file \
+        "${PRECURSOR_INPUT_STAGE}" "PRECURSOR" "${PRECURSOR_RUNID}" "${PRECURSOR_RID_PAD}" "${common_restart_tid}" "discover")
+    emergency_deadline_exceeded && {
+        mlog "[Update] Emergency deadline reached during PRECURSOR budget discovery."
+        cleanup_input_stages
+        return 2
+    }
     
-    # Compute absolute minimum across restart files and all budgets
-    local final_restart_tid="${common_restart_tid}"
+    # Budgets constrain the latest usable TID, but cannot create a solver restart.
+    budget_ceiling="${common_restart_tid}"
     
-    if [[ -n "${primary_min_budget}" && "${primary_min_budget}" -lt "${final_restart_tid}" ]]; then
+    if [[ -n "${primary_min_budget}" && "${primary_min_budget}" -lt "${budget_ceiling}" ]]; then
         mlog "[Update] PRIMARY budgets constrain restart to TIDX=${primary_min_budget}"
-        final_restart_tid="${primary_min_budget}"
+        budget_ceiling="${primary_min_budget}"
     fi
     
-    if [[ -n "${precursor_min_budget}" && "${precursor_min_budget}" -lt "${final_restart_tid}" ]]; then
+    if [[ -n "${precursor_min_budget}" && "${precursor_min_budget}" -lt "${budget_ceiling}" ]]; then
         mlog "[Update] PRECURSOR budgets constrain restart to TIDX=${precursor_min_budget}"
-        final_restart_tid="${precursor_min_budget}"
+        budget_ceiling="${precursor_min_budget}"
+    fi
+
+    final_restart_tid="$(latest_common_restart_tid \
+        "${PRIMARY_INPUTDIR}" "${PRIMARY_RID_PAD}" \
+        "${PRECURSOR_INPUTDIR}" "${PRECURSOR_RID_PAD}" \
+        "${budget_ceiling}")"
+    if [[ -z "${final_restart_tid}" || ! "${final_restart_tid}" =~ ^[0-9]+$ ]]; then
+        mlog "[Update] ERROR: No common solver restart exists at or below budget ceiling ${budget_ceiling}."
+        cleanup_input_stages
+        return 1
     fi
     
     mlog "================================================================"
@@ -2151,18 +2711,23 @@ _update_input_files() {
     
     # PHASE 2: Update restart files with final common TIDX
     mlog "[Update] Phase 2: Writing restart file settings..."
-    set_namelist_value "${PRIMARY_INPUTFILE}"   "useRestartFile"   ".true."             || return 1
-    set_namelist_value "${PRIMARY_INPUTFILE}"   "restartFile_TID"  "${final_restart_tid}"             || return 1
-    set_namelist_value "${PRIMARY_INPUTFILE}"   "restartFile_RID"  "${PRIMARY_RUNID}"   || return 1
+    emergency_deadline_exceeded && {
+        mlog "[Update] Emergency deadline reached before staged input mutation."
+        cleanup_input_stages
+        return 2
+    }
+    set_namelist_value "${PRIMARY_INPUT_STAGE}"   "useRestartFile"   ".true."             || return 1
+    set_namelist_value "${PRIMARY_INPUT_STAGE}"   "restartFile_TID"  "${final_restart_tid}"             || return 1
+    set_namelist_value "${PRIMARY_INPUT_STAGE}"   "restartFile_RID"  "${PRIMARY_RUNID}"   || return 1
 
-    set_namelist_value "${PRECURSOR_INPUTFILE}" "useRestartFile"   ".true."             || return 1
-    set_namelist_value "${PRECURSOR_INPUTFILE}" "restartFile_TID"  "${final_restart_tid}"             || return 1
-    set_namelist_value "${PRECURSOR_INPUTFILE}" "restartFile_RID"  "${PRECURSOR_RUNID}" || return 1
+    set_namelist_value "${PRECURSOR_INPUT_STAGE}" "useRestartFile"   ".true."             || return 1
+    set_namelist_value "${PRECURSOR_INPUT_STAGE}" "restartFile_TID"  "${final_restart_tid}"             || return 1
+    set_namelist_value "${PRECURSOR_INPUT_STAGE}" "restartFile_RID"  "${PRECURSOR_RUNID}" || return 1
 
     mlog "[Update] PRIMARY   — verified restart fields:"
-    grep -iE 'useRestartFile|restartFile_TID|restartFile_RID' "${PRIMARY_INPUTFILE}" >> "${MONITOR_LOG}"
+    grep -iE 'useRestartFile|restartFile_TID|restartFile_RID' "${PRIMARY_INPUT_STAGE}" >> "${MONITOR_LOG}"
     mlog "[Update] PRECURSOR — verified restart fields:"
-    grep -iE 'useRestartFile|restartFile_TID|restartFile_RID' "${PRECURSOR_INPUTFILE}" >> "${MONITOR_LOG}"
+    grep -iE 'useRestartFile|restartFile_TID|restartFile_RID' "${PRECURSOR_INPUT_STAGE}" >> "${MONITOR_LOG}"
     
     # PHASE 3: Re-process budgets with final restart TID to ensure consistency
     mlog "================================================================"
@@ -2171,24 +2736,46 @@ _update_input_files() {
     
     # These must succeed or restart sequence aborts
     process_budget_restarts_for_file \
-        "${PRIMARY_INPUTFILE}" "PRIMARY" "${PRIMARY_RUNID}" "${PRIMARY_RID_PAD}" "${final_restart_tid}" "update" >/dev/null || {
+        "${PRIMARY_INPUT_STAGE}" "PRIMARY" "${PRIMARY_RUNID}" "${PRIMARY_RID_PAD}" "${final_restart_tid}" "update" >/dev/null || {
         mlog "[Update] CRITICAL ERROR: PRIMARY budget update failed - aborting restart"
         return 1
     }
     
     process_budget_restarts_for_file \
-        "${PRECURSOR_INPUTFILE}" "PRECURSOR" "${PRECURSOR_RUNID}" "${PRECURSOR_RID_PAD}" "${final_restart_tid}" "update" >/dev/null || {
+        "${PRECURSOR_INPUT_STAGE}" "PRECURSOR" "${PRECURSOR_RUNID}" "${PRECURSOR_RID_PAD}" "${final_restart_tid}" "update" >/dev/null || {
         mlog "[Update] CRITICAL ERROR: PRECURSOR budget update failed - aborting restart"
         return 1
     }
+
+    emergency_deadline_exceeded && {
+        mlog "[Update] Emergency deadline reached before committing staged inputs."
+        cleanup_input_stages
+        return 2
+    }
     
+    if ! commit_staged_input "${PRIMARY_INPUT_STAGE}" "${PRIMARY_INPUTFILE}"; then
+        mlog "[Update] ERROR: Failed to commit PRIMARY staged input."
+        cleanup_input_stages
+        return 1
+    fi
+    if ! commit_staged_input "${PRECURSOR_INPUT_STAGE}" "${PRECURSOR_INPUTFILE}"; then
+        mlog "[Update] ERROR: Failed to commit PRECURSOR staged input; restoring both originals."
+        _restore_input_files
+        cleanup_input_stages
+        return 1
+    fi
+
+    cleanup_input_stages
+    INPUT_UPDATE_IN_PROGRESS=0
     mlog "[Update] All restart configurations complete and synchronized."
 }
 
 _restore_input_files() {
     mlog "[Restore] Reverting input files to pre-edit state..."
-    cp "${PRIMARY_INPUTFILE}.bak_job${SLURM_JOB_ID}"   "${PRIMARY_INPUTFILE}"   2>/dev/null || true
-    cp "${PRECURSOR_INPUTFILE}.bak_job${SLURM_JOB_ID}" "${PRECURSOR_INPUTFILE}" 2>/dev/null || true
+    cp --preserve=all "${PRIMARY_INPUTFILE}.bak_job${SLURM_JOB_ID}"   "${PRIMARY_INPUTFILE}"   2>/dev/null || true
+    cp --preserve=all "${PRECURSOR_INPUTFILE}.bak_job${SLURM_JOB_ID}" "${PRECURSOR_INPUTFILE}" 2>/dev/null || true
+    cleanup_input_stages
+    INPUT_UPDATE_IN_PROGRESS=0
     mlog "[Restore] Done."
 }
 
@@ -2198,11 +2785,25 @@ _restore_input_files() {
 
 CHILD_SUBMITTED=0
 CHILD_JOB_ID=""
+EMERGENCY_SIGNAL_PENDING=0
+EMERGENCY_DEADLINE_EPOCH=0
+
+emergency_deadline_exceeded() {
+    [[ "${EMERGENCY_SIGNAL_PENDING}" -eq 1 ]] || return 1
+    [[ "$(date +%s)" -ge "${EMERGENCY_DEADLINE_EPOCH}" ]]
+}
 
 emergency_resubmit() {
     local reason="${1:-SIGTERM}"
     local child_id submit_rc
     local emerg_tid=""
+
+    if [[ "${RESTART_LOCK_OWNED}" -eq 1 ]]; then
+        EMERGENCY_SIGNAL_PENDING=1
+        EMERGENCY_DEADLINE_EPOCH=$(( $(date +%s) + EMERGENCY_HANDOFF_DEADLINE_SECONDS ))
+        mlog "[Emergency] ${reason} received during an active restart handoff; deadline=${EMERGENCY_HANDOFF_DEADLINE_SECONDS}s."
+        return 0
+    fi
 
     # Do not let multiple trigger paths run restart logic simultaneously
     if ! acquire_restart_lock; then
@@ -2222,11 +2823,7 @@ emergency_resubmit() {
         mlog "[Emergency] Cannot prepare restart inputs safely."
 
         # Best effort shutdown of MPI before exiting
-        if [[ -n "${MPI_PID:-}" ]] && kill -0 "${MPI_PID}" 2>/dev/null; then
-            mlog "[Emergency] Terminating MPI PID ${MPI_PID}."
-            kill -TERM "${MPI_PID}" 2>/dev/null || true
-            wait "${MPI_PID}" 2>/dev/null || true
-        fi
+        terminate_mpi_launcher "emergency without restart files"
 
         release_restart_lock
         exit 1
@@ -2238,12 +2835,9 @@ emergency_resubmit() {
     if ! _update_input_files "${emerg_tid}"; then
         mlog "[Emergency] ERROR: _update_input_files failed for TID ${emerg_tid}."
         mlog "[Emergency] Any downstream job could start from stale inputs. Aborting emergency handoff."
+        _restore_input_files
 
-        if [[ -n "${MPI_PID:-}" ]] && kill -0 "${MPI_PID}" 2>/dev/null; then
-            mlog "[Emergency] Terminating MPI PID ${MPI_PID}."
-            kill -TERM "${MPI_PID}" 2>/dev/null || true
-            wait "${MPI_PID}" 2>/dev/null || true
-        fi
+        terminate_mpi_launcher "emergency input-update failure"
 
         release_restart_lock
         exit 1
@@ -2252,23 +2846,19 @@ emergency_resubmit() {
     mlog "[Emergency] Input files prepared successfully."
     mlog "[Emergency] Attempting child submission..."
 
-    child_id="$(submit_with_retry none "" 3 10)"
+    child_id="$(submit_with_retry afterany "${SLURM_JOB_ID}" 1 0)"
     submit_rc=$?
 
     if [[ "${submit_rc}" -eq 0 && -n "${child_id}" && "${child_id}" =~ ^[0-9]+$ ]]; then
         mlog "[Emergency] Child submitted successfully: ${child_id}"
 
-        if [[ -n "${MPI_PID:-}" ]] && kill -0 "${MPI_PID}" 2>/dev/null; then
-            mlog "[Emergency] Terminating MPI PID ${MPI_PID}."
-            kill -TERM "${MPI_PID}" 2>/dev/null || true
-            wait "${MPI_PID}" 2>/dev/null || true
-        fi
+        terminate_mpi_launcher "emergency child submitted"
 
         release_restart_lock
         exit 0
     fi
 
-    mlog "[Emergency] Child submission failed after 3 attempts."
+    mlog "[Emergency] Child submission failed."
     mlog "[Emergency] Falling back to staged handoff."
 
     printf 'jobid=%s\nreason=%s\ntime=%s\n' \
@@ -2276,15 +2866,11 @@ emergency_resubmit() {
         > "${RESTART_READY_FILE}"
     sync || true
 
-    if [[ -n "${MPI_PID:-}" ]] && kill -0 "${MPI_PID}" 2>/dev/null; then
-        mlog "[Emergency] Terminating MPI PID ${MPI_PID}."
-        kill -TERM "${MPI_PID}" 2>/dev/null || true
-        wait "${MPI_PID}" 2>/dev/null || true
-    fi
+    terminate_mpi_launcher "emergency staged handoff"
 
     release_restart_lock
-    mlog "[Emergency] Exiting current job after staged handoff."
-    exit 0
+    mlog "[Emergency] No child was submitted by this script; external recovery is required."
+    exit 1
 }
 
 trap emergency_resubmit TERM
@@ -2297,9 +2883,15 @@ trap cleanup_watchers EXIT
 # Write CSV header
 echo "timestamp,epoch,jobid,step,maxrss(KB),averss(KB),maxvmsize(KB),avevmsize(KB)" > "${MEM_CSV}"
 
+SIM_DONE_KEY="${CONFIG_ABS}:${PRIMARY_INPUTFILE}:${PRECURSOR_INPUTFILE}:${PRIMARY_RUNID}:${PRECURSOR_RUNID}:${SIMULATION_TSTOP}"
 if [[ -f "${SIM_DONE_FILE}" ]]; then
-    mlog "SIM_DONE marker found. Exiting without launching MPI."
-    exit 0
+    RECORDED_SIM_DONE_KEY="$(head -1 "${SIM_DONE_FILE}" 2>/dev/null || true)"
+    if [[ "${RECORDED_SIM_DONE_KEY}" == "${SIM_DONE_KEY}" ]]; then
+        mlog "SIM_DONE marker matches current run IDs and tstop. Exiting without launching MPI."
+        exit 0
+    fi
+    mlog "Ignoring stale SIM_DONE marker from a different run configuration."
+    rm -f "${SIM_DONE_FILE}"
 fi
 
 if [[ -f "${RESTART_READY_FILE}" ]]; then
@@ -2340,7 +2932,11 @@ ELAPSED_PER_STEP_VALID=0
 
 OUTPUT_LOG_SEEN=0
 LAST_LOG_MTIME=0
-LAST_PROGRESS_EPOCH=0
+LAST_PROGRESS_EPOCH=$(date +%s)
+LAST_LOG_ACTIVITY_EPOCH="${LAST_PROGRESS_EPOCH}"
+END_REACHED=0
+END_REACHED_EPOCH=0
+END_SHUTDOWN_FORCED=0
 
 ESTIMATE_BAD_SAMPLES=0
 ESTIMATE_LAST_BAD=0
@@ -2356,11 +2952,11 @@ ELAPSED_SOURCE=""
 mlog "Monitor loop started. Polling '${OUTPUT_LOG}' every ${MONITOR_INTERVAL}s."
 mlog "================================================================"
 
-while kill -0 "${MPI_PID}" 2>/dev/null; do
+while mpi_launcher_running; do
 
     sleep "${MONITOR_INTERVAL}"
 
-    if ! kill -0 "${MPI_PID}" 2>/dev/null; then
+    if ! mpi_launcher_running; then
         mlog "[Monitor] MPI process finished normally."
         break
     fi
@@ -2368,6 +2964,7 @@ while kill -0 "${MPI_PID}" 2>/dev/null; do
     NOW_EPOCH=$(date +%s)
     TRIGGER_REASON=""
     CURRENT_TIDX=""
+    MEMORY_HARD_STOP_ACTIVE=0
 
     # ------------------------------------------------------------------
     #  MEMORY SAMPLING — one sstat call per cycle feeds CSV + guard logic
@@ -2390,6 +2987,7 @@ while kill -0 "${MPI_PID}" 2>/dev/null; do
             # HARD STOP: immediate restart at critical utilization (no persistence required)
             # Convert fraction to percentage for comparison
             if [[ "${MEM_UTIL_PCT}" -ge "${MEMORY_GUARD_HARD_STOP_PCT}" ]]; then
+                MEMORY_HARD_STOP_ACTIVE=1
                 mlog "[Monitor][Mem] rss=${CURRENT_MAXRSS_KB}KB (${MEM_UTIL_PCT}%) | scope=${MEMORY_GUARD_SCOPE_RESOLVED} | cmp=${MEMORY_GUARD_COMPARE_LIMIT_KB}KB | trig=${MEMORY_GUARD_TRIGGER_KB}KB | STATUS: CRITICAL_HARD_STOP"
                 TRIGGER_REASON="MEMORY GUARD HARD STOP (MaxRSS at ${MEM_UTIL_PCT}% >= ${MEMORY_GUARD_HARD_STOP_PCT}% critical threshold)"
                 
@@ -2453,28 +3051,50 @@ while kill -0 "${MPI_PID}" 2>/dev/null; do
     #  OUTPUT LOG PROGRESS TRACKING
     # ------------------------------------------------------------------
 
+    OUTPUT_LOG_AVAILABLE=1
     if [[ ! -f "${OUTPUT_LOG}" ]]; then
+        OUTPUT_LOG_AVAILABLE=0
         mlog "[Monitor] Output log not yet visible, waiting..."
-        continue
+        CURRENT_TIDX_RAW=""
+    else
+        CURRENT_LOG_MTIME=$(get_file_mtime_epoch "${OUTPUT_LOG}")
+
+        if [[ "${OUTPUT_LOG_SEEN}" -eq 0 ]]; then
+            OUTPUT_LOG_SEEN=1
+            LAST_LOG_MTIME="${CURRENT_LOG_MTIME}"
+            LAST_PROGRESS_EPOCH="${NOW_EPOCH}"
+            LAST_LOG_ACTIVITY_EPOCH="${NOW_EPOCH}"
+        fi
+
+        if [[ "${CURRENT_LOG_MTIME}" -gt "${LAST_LOG_MTIME}" ]]; then
+            LAST_LOG_MTIME="${CURRENT_LOG_MTIME}"
+            LAST_LOG_ACTIVITY_EPOCH="${NOW_EPOCH}"
+        fi
+
+        CURRENT_TIDX_RAW="$(get_latest_logged_tidx "${OUTPUT_LOG}" || true)"
     fi
-
-    CURRENT_LOG_MTIME=$(get_file_mtime_epoch "${OUTPUT_LOG}")
-
-    if [[ "${OUTPUT_LOG_SEEN}" -eq 0 ]]; then
-        OUTPUT_LOG_SEEN=1
-        LAST_LOG_MTIME="${CURRENT_LOG_MTIME}"
-        LAST_PROGRESS_EPOCH="${NOW_EPOCH}"
-    fi
-
-    if [[ "${CURRENT_LOG_MTIME}" -gt "${LAST_LOG_MTIME}" ]]; then
-        LAST_LOG_MTIME="${CURRENT_LOG_MTIME}"
-        LAST_PROGRESS_EPOCH="${NOW_EPOCH}"
-    fi
-
-    CURRENT_TIDX_RAW=$(tail -n 100 "${OUTPUT_LOG}" | grep 'TIDX:' | tail -1 | awk '{print $NF}')
 
     if [[ -n "${CURRENT_TIDX_RAW}" && "${CURRENT_TIDX_RAW}" =~ ^[0-9]+$ ]]; then
         CURRENT_TIDX=$(( 10#${CURRENT_TIDX_RAW} ))
+    fi
+
+    SIM_END_ESTIMATE_VALID=0
+    STEPS_TO_END=""
+    CURRENT_SIM_TIME=""
+    CURRENT_SIM_DT=""
+    SIM_END_RECORDS=0
+    if [[ -n "${CURRENT_TIDX}" ]]; then
+        SIM_END_ESTIMATE=$(get_latest_sim_end_estimate \
+            "${OUTPUT_LOG}" "${CURRENT_TIDX}" "${SIMULATION_TSTOP}" || true)
+        if [[ -n "${SIM_END_ESTIMATE}" ]]; then
+            read -r STEPS_TO_END CURRENT_SIM_TIME CURRENT_SIM_DT SIM_END_RECORDS \
+                <<< "${SIM_END_ESTIMATE}"
+            if [[ "${STEPS_TO_END}" =~ ^[0-9]+$ && \
+                  "${SIM_END_RECORDS}" =~ ^[0-9]+$ && \
+                  "${SIM_END_RECORDS}" -gt 0 ]]; then
+                SIM_END_ESTIMATE_VALID=1
+            fi
+        fi
     fi
 
     STEP_DELTA=0
@@ -2503,54 +3123,117 @@ while kill -0 "${MPI_PID}" 2>/dev/null; do
         LAST_PROGRESS_EPOCH="${NOW_EPOCH}"
     fi
 
-    TIME_USED=$(( NOW_EPOCH - JOB_START_EPOCH ))
-    TIME_LEFT=$(( WALL_TIME_SECONDS - TIME_USED ))
+    TIME_LEFT="$(get_live_job_time_left_seconds || true)"
+    if [[ ! "${TIME_LEFT}" =~ ^-?[0-9]+$ ]]; then
+        TIME_USED=$(( NOW_EPOCH - JOB_START_EPOCH ))
+        TIME_LEFT=$(( WALL_TIME_SECONDS - TIME_USED ))
+        TIME_LEFT_SOURCE="launch-fallback"
+    else
+        TIME_LEFT_SOURCE="slurm-live"
+    fi
 
     IDLE_FOR=0
     if [[ "${LAST_PROGRESS_EPOCH}" -gt 0 ]]; then
         IDLE_FOR=$(( NOW_EPOCH - LAST_PROGRESS_EPOCH ))
+    fi
+    LOG_IDLE_FOR=0
+    if [[ "${LAST_LOG_ACTIVITY_EPOCH}" -gt 0 ]]; then
+        LOG_IDLE_FOR=$(( NOW_EPOCH - LAST_LOG_ACTIVITY_EPOCH ))
     fi
 
     # ------------------------------------------------------------------
     #  TRIGGER EVALUATION
     # ------------------------------------------------------------------
 
-    if [[ -z "${TRIGGER_REASON}" && "${LAST_PROGRESS_EPOCH}" -gt 0 && "${IDLE_FOR}" -ge "${FROZEN_TIMEOUT_SECONDS}" ]]; then
-        TRIGGER_REASON="FROZEN (no log/TIDX progress for ${IDLE_FOR}s >= ${FROZEN_TIMEOUT_SECONDS}s)"
+    if [[ "${SIM_END_ESTIMATE_VALID}" -eq 1 && "${STEPS_TO_END}" -eq 0 && "${END_REACHED}" -eq 0 ]]; then
+        END_REACHED=1
+        END_REACHED_EPOCH="${NOW_EPOCH}"
+        TRIGGER_REASON=""
+        mlog "[Monitor][Time] TIDX=${CURRENT_TIDX} | sim_time=${CURRENT_SIM_TIME} >= tstop=${SIMULATION_TSTOP} | STATUS: END_REACHED"
+        mlog "[Monitor] Simulation stop time reached; supervising normal MPI shutdown for up to ${END_SHUTDOWN_GRACE_SECONDS}s."
+    fi
+
+    if [[ "${END_REACHED}" -eq 1 ]]; then
+        TRIGGER_REASON=""
+        END_WAITED=$(( NOW_EPOCH - END_REACHED_EPOCH ))
+        END_SHUTDOWN_ACTION="$(get_end_shutdown_action \
+            "${MEMORY_HARD_STOP_ACTIVE}" "${END_WAITED}" \
+            "${END_SHUTDOWN_GRACE_SECONDS}" "${TIME_LEFT}" "${HARD_CUTOFF_SECONDS}")"
+        if [[ "${END_SHUTDOWN_ACTION}" == "terminate-memory" ]]; then
+            mlog "[Monitor][Time] Memory hard stop active after tstop; terminating without restart."
+            END_SHUTDOWN_FORCED=1
+            terminate_mpi_launcher "memory hard stop after tstop"
+            break
+        elif [[ "${END_SHUTDOWN_ACTION}" == "terminate-time" ]]; then
+            mlog "[Monitor][Time] MPI still active ${END_WAITED}s after tstop; terminating without restart."
+            END_SHUTDOWN_FORCED=1
+            terminate_mpi_launcher "shutdown timeout after tstop"
+            break
+        fi
+        mlog "[Monitor][Time] Waiting for normal MPI exit after tstop (${END_WAITED}/${END_SHUTDOWN_GRACE_SECONDS}s)."
 
     elif [[ -z "${TRIGGER_REASON}" && "${TIME_LEFT}" -le "${HARD_CUTOFF_SECONDS}" ]]; then
         TRIGGER_REASON="HARD CUTOFF (${TIME_LEFT}s left <= threshold ${HARD_CUTOFF_SECONDS}s)"
 
+    elif [[ -z "${TRIGGER_REASON}" && "${LAST_PROGRESS_EPOCH}" -gt 0 && "${IDLE_FOR}" -ge "${FROZEN_TIMEOUT_SECONDS}" ]]; then
+        TRIGGER_REASON="FROZEN (no TIDX progress for ${IDLE_FOR}s >= ${FROZEN_TIMEOUT_SECONDS}s; log idle ${LOG_IDLE_FOR}s)"
+
     elif [[ -z "${TRIGGER_REASON}" && "${ELAPSED_PER_STEP_VALID}" -eq 1 && -n "${CURRENT_TIDX}" ]]; then
-        STEPS_SINCE_DUMP=$(( CURRENT_TIDX % T_RESTART_DUMP ))
-        STEPS_TO_DUMP=$(( T_RESTART_DUMP - STEPS_SINCE_DUMP ))
-        TIME_NEEDED=$(echo "scale=2; ${SAFETY_FACTOR} * ${STEPS_TO_DUMP} * ${ELAPSED_PER_STEP}" | bc 2>/dev/null)
+        NEXT_COMMON_DUMP=$(next_common_dump_after \
+            "${CURRENT_TIDX}" \
+            "${PRIMARY_RESTART_TID}" "${PRIMARY_T_RESTART_DUMP}" \
+            "${PRECURSOR_RESTART_TID}" "${PRECURSOR_T_RESTART_DUMP}" || true)
+        STEPS_TO_DUMP=""
+        STEPS_TO_TARGET=""
+        TARGET_KIND=""
+        if [[ "${NEXT_COMMON_DUMP}" =~ ^[0-9]+$ && "${NEXT_COMMON_DUMP}" -gt "${CURRENT_TIDX}" ]]; then
+            STEPS_TO_DUMP=$(( NEXT_COMMON_DUMP - CURRENT_TIDX ))
+            STEPS_TO_TARGET="${STEPS_TO_DUMP}"
+            TARGET_KIND="common_dump"
+        fi
+        END_ESTIMATE_LOG="end_in=unknown"
+        if [[ "${SIM_END_ESTIMATE_VALID}" -eq 1 ]] && \
+           { [[ -z "${STEPS_TO_TARGET}" ]] || [[ "${STEPS_TO_END}" -lt "${STEPS_TO_TARGET}" ]]; }; then
+            STEPS_TO_TARGET="${STEPS_TO_END}"
+            TARGET_KIND="end"
+        fi
+        if [[ "${SIM_END_ESTIMATE_VALID}" -eq 1 ]]; then
+            END_ESTIMATE_LOG="end_in=${STEPS_TO_END} sim_time=${CURRENT_SIM_TIME} dt=${CURRENT_SIM_DT} domains=${SIM_END_RECORDS}"
+        fi
 
-        [[ -z "${TIME_NEEDED}" ]] && { mlog "[Monitor][Time] WARNING: bc failed to compute TIME_NEEDED, skipping."; continue; }
-
-        # Format time per step for cleaner display
-        TIME_PER_STEP_FMT=$(echo "scale=1; ${ELAPSED_PER_STEP}" | bc 2>/dev/null)
-        TIME_NEEDED_FMT=$(echo "scale=0; ${TIME_NEEDED}" | bc 2>/dev/null)
-
-        NOT_ENOUGH=$(echo "${TIME_LEFT} < ${TIME_NEEDED}" | bc 2>/dev/null)
-        NOT_ENOUGH="${NOT_ENOUGH:-0}"
-
-        if [[ "${NOT_ENOUGH}" -eq 1 ]]; then
-            ESTIMATE_BAD_SAMPLES=$(( ESTIMATE_BAD_SAMPLES + 1 ))
-            ESTIMATE_LAST_BAD=1
-            mlog "[Monitor][Time] TIDX=${CURRENT_TIDX} | left=${TIME_LEFT}s < need=${TIME_NEEDED_FMT}s | dump_in=${STEPS_TO_DUMP} @ ${TIME_PER_STEP_FMT}s/step | STATUS: UNSAFE bad=${ESTIMATE_BAD_SAMPLES}/${ESTIMATE_PERSISTENCE_SAMPLES} | idle=${IDLE_FOR}s"
-            if [[ "${ESTIMATE_BAD_SAMPLES}" -ge "${ESTIMATE_PERSISTENCE_SAMPLES}" ]]; then
-                TRIGGER_REASON="ESTIMATE persisted for ${ESTIMATE_BAD_SAMPLES} consecutive samples (${TIME_LEFT}s left < ${TIME_NEEDED}s needed)"
-            fi
+        if [[ -z "${STEPS_TO_TARGET}" ]]; then
+            mlog "[Monitor][Time] TIDX=${CURRENT_TIDX} | left=${TIME_LEFT}s | STATUS: NO_COMMON_DUMP (restart schedules do not intersect)"
+            ESTIMATE_BAD_SAMPLES=0
+            ESTIMATE_LAST_BAD=0
         else
-            if [[ "${ESTIMATE_LAST_BAD}" -eq 1 || "${ESTIMATE_BAD_SAMPLES}" -gt 0 ]]; then
-                mlog "[Monitor][Time] TIDX=${CURRENT_TIDX} | left=${TIME_LEFT}s > need=${TIME_NEEDED_FMT}s | dump_in=${STEPS_TO_DUMP} @ ${TIME_PER_STEP_FMT}s/step | STATUS: RECOVERED | idle=${IDLE_FOR}s"
-                ESTIMATE_BAD_SAMPLES=0
-                ESTIMATE_LAST_BAD=0
+            TIME_NEEDED=$(echo "scale=2; ${SAFETY_FACTOR} * ${STEPS_TO_TARGET} * ${ELAPSED_PER_STEP}" | bc 2>/dev/null)
+
+            if [[ -z "${TIME_NEEDED}" ]]; then
+                mlog "[Monitor][Time] WARNING: bc failed to compute TIME_NEEDED, skipping estimate."
             else
-                mlog "[Monitor][Time] TIDX=${CURRENT_TIDX} | left=${TIME_LEFT}s > need=${TIME_NEEDED_FMT}s | dump_in=${STEPS_TO_DUMP} @ ${TIME_PER_STEP_FMT}s/step | STATUS: SAFE | idle=${IDLE_FOR}s"
-                ESTIMATE_BAD_SAMPLES=0
-                ESTIMATE_LAST_BAD=0
+                # Format time per step for cleaner display
+                TIME_PER_STEP_FMT=$(echo "scale=1; ${ELAPSED_PER_STEP}" | bc 2>/dev/null)
+                TIME_NEEDED_FMT=$(echo "scale=0; ${TIME_NEEDED}" | bc 2>/dev/null)
+
+                NOT_ENOUGH=$(echo "${TIME_LEFT} < ${TIME_NEEDED}" | bc 2>/dev/null)
+                NOT_ENOUGH="${NOT_ENOUGH:-0}"
+
+                if [[ "${NOT_ENOUGH}" -eq 1 ]]; then
+                    ESTIMATE_BAD_SAMPLES=$(( ESTIMATE_BAD_SAMPLES + 1 ))
+                    ESTIMATE_LAST_BAD=1
+                    mlog "[Monitor][Time] TIDX=${CURRENT_TIDX} | left=${TIME_LEFT}s < need=${TIME_NEEDED_FMT}s | target=${TARGET_KIND} target_in=${STEPS_TO_TARGET} common_dump_in=${STEPS_TO_DUMP:-none} ${END_ESTIMATE_LOG} @ ${TIME_PER_STEP_FMT}s/step | STATUS: UNSAFE bad=${ESTIMATE_BAD_SAMPLES}/${ESTIMATE_PERSISTENCE_SAMPLES} | idle=${IDLE_FOR}s"
+                    if [[ "${ESTIMATE_BAD_SAMPLES}" -ge "${ESTIMATE_PERSISTENCE_SAMPLES}" ]]; then
+                        TRIGGER_REASON="ESTIMATE persisted for ${ESTIMATE_BAD_SAMPLES} consecutive samples (${TIME_LEFT}s left < ${TIME_NEEDED}s needed to reach ${TARGET_KIND})"
+                    fi
+                else
+                    if [[ "${ESTIMATE_LAST_BAD}" -eq 1 || "${ESTIMATE_BAD_SAMPLES}" -gt 0 ]]; then
+                        mlog "[Monitor][Time] TIDX=${CURRENT_TIDX} | left=${TIME_LEFT}s > need=${TIME_NEEDED_FMT}s | target=${TARGET_KIND} target_in=${STEPS_TO_TARGET} common_dump_in=${STEPS_TO_DUMP:-none} ${END_ESTIMATE_LOG} @ ${TIME_PER_STEP_FMT}s/step | STATUS: RECOVERED | idle=${IDLE_FOR}s"
+                    else
+                        mlog "[Monitor][Time] TIDX=${CURRENT_TIDX} | left=${TIME_LEFT}s > need=${TIME_NEEDED_FMT}s | target=${TARGET_KIND} target_in=${STEPS_TO_TARGET} common_dump_in=${STEPS_TO_DUMP:-none} ${END_ESTIMATE_LOG} @ ${TIME_PER_STEP_FMT}s/step | STATUS: SAFE | idle=${IDLE_FOR}s"
+                    fi
+                    ESTIMATE_BAD_SAMPLES=0
+                    ESTIMATE_LAST_BAD=0
+                fi
             fi
         fi
     else
@@ -2623,11 +3306,24 @@ while kill -0 "${MPI_PID}" 2>/dev/null; do
         if ! _update_input_files "${COMMON_TID}"; then
             mlog "[Monitor] ERROR: Input file update failed. Restoring backups and retrying next cycle."
             _restore_input_files
+            if [[ "${EMERGENCY_SIGNAL_PENDING}" -eq 1 ]]; then
+                mlog "[Monitor] Emergency deadline interrupted restart preparation; terminating without unsafe submission."
+                terminate_mpi_launcher "emergency deadline during restart preparation"
+                release_restart_lock
+                exit 1
+            fi
             release_restart_lock
             continue
         fi
 
-        CHILD_JOB_ID="$(submit_with_retry afterany "${SLURM_JOB_ID}" 3 10 || true)"
+        SUBMIT_ATTEMPTS=3
+        SUBMIT_RETRY_SLEEP=10
+        if [[ "${EMERGENCY_SIGNAL_PENDING}" -eq 1 ]]; then
+            SUBMIT_ATTEMPTS=1
+            SUBMIT_RETRY_SLEEP=0
+        fi
+        CHILD_JOB_ID="$(submit_with_retry afterany "${SLURM_JOB_ID}" \
+            "${SUBMIT_ATTEMPTS}" "${SUBMIT_RETRY_SLEEP}" || true)"
 
         if [[ -z "${CHILD_JOB_ID}" || ! "${CHILD_JOB_ID}" =~ ^[0-9]+$ ]]; then
             mlog "[Monitor] sbatch failed after retries (compute-node submission blocked?)."
@@ -2641,8 +3337,7 @@ while kill -0 "${MPI_PID}" 2>/dev/null; do
 
         mlog "[Monitor] Terminating MPI launcher (PID=${MPI_PID})..."
         trap - TERM
-        kill "${MPI_PID}" 2>/dev/null || true
-        wait "${MPI_PID}" 2>/dev/null || true
+        terminate_mpi_launcher "restart child submitted"
         mlog "[Monitor] MPI launcher terminated."
         break
     fi
@@ -2653,13 +3348,27 @@ trap - TERM
 cleanup_watchers
 release_restart_lock
 
-wait "${MPI_PID}" 2>/dev/null || true
-MPI_EXIT=$?
+if [[ -n "${MPI_WAIT_STATUS}" ]]; then
+    MPI_EXIT="${MPI_WAIT_STATUS}"
+elif wait "${MPI_PID}" 2>/dev/null; then
+    MPI_EXIT=0
+else
+    MPI_EXIT=$?
+fi
 
 mlog "================================================================"
 if [[ "${CHILD_SUBMITTED}" -eq 1 ]]; then
     mlog "Status : Restarted — child job ID=${CHILD_JOB_ID} queued."
 else
     mlog "Status : Simulation finished (MPI exit code ${MPI_EXIT})."
+    if should_write_sim_done "${MPI_EXIT}" "${END_REACHED}" "${END_SHUTDOWN_FORCED}"; then
+        printf '%s\n' "${SIM_DONE_KEY}" > "${SIM_DONE_FILE}"
+    elif [[ "${MPI_EXIT}" -eq 0 ]]; then
+        mlog "Status : Completion marker not written because tstop was not verified."
+    fi
 fi
 mlog "================================================================"
+
+if [[ "${CHILD_SUBMITTED}" -eq 0 && "${MPI_EXIT}" -ne 0 ]]; then
+    exit "${MPI_EXIT}"
+fi
