@@ -2207,53 +2207,117 @@ find_all_time_avg_budget_states() {
     local rid_pad="$2"
     local budget_type="$3"
     local max_tidx="$4"
+    local squeeze="$5"
+    local budget0_field_count="$6"
     
-    # For budgetType=0, check budget0 with terms 1-16,26,31
-    if [[ "${budget_type}" == "0" ]]; then
-        local required_terms="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 26 31"
-        local pattern="Run${rid_pad}_budget0_term??_t??????_n??????.s3D"
+    local pattern="Run${rid_pad}_budget0_term??_t??????_n??????.s3D"
+    
+    local tidx_list=$(find "${budget_dir}" -maxdepth 1 -name "${pattern}" 2>/dev/null \
+        | sed 's/.*_t\([0-9]\{6\}\)_n.*/\1/' \
+        | sort -rn \
+        | uniq)
+    
+    [[ -z "${tidx_list}" ]] && return 1
+    
+    while IFS= read -r tidx; do
+        emergency_deadline_exceeded && return 2
+        local tidx_num=$((10#${tidx}))
         
-        local tidx_list=$(find "${budget_dir}" -maxdepth 1 -name "${pattern}" 2>/dev/null \
-            | sed 's/.*_t\([0-9]\{6\}\)_n.*/\1/' \
-            | sort -rn \
-            | uniq)
+        [[ "${tidx_num}" -gt "${max_tidx}" ]] && continue
         
-        [[ -z "${tidx_list}" ]] && return 1
-        
-        while IFS= read -r tidx; do
+        local counter_list
+        counter_list=$(find "${budget_dir}" -maxdepth 1 \
+            -name "Run${rid_pad}_budget0_term??_t${tidx}_n??????.s3D" \
+            2>/dev/null \
+            | sed 's/.*_n\([0-9]\{6\}\)\.s3D/\1/' \
+            | sort -u)
+
+        while IFS= read -r counter; do
             emergency_deadline_exceeded && return 2
-            local tidx_num=$((10#${tidx}))
-            
-            [[ "${tidx_num}" -gt "${max_tidx}" ]] && continue
-            
-            local counter_list
-            counter_list=$(find "${budget_dir}" -maxdepth 1 \
-                -name "Run${rid_pad}_budget0_term??_t${tidx}_n??????.s3D" \
-                2>/dev/null \
-                | sed 's/.*_n\([0-9]\{6\}\)\.s3D/\1/' \
-                | sort -u)
+            [[ "${counter}" =~ ^[0-9]{6}$ ]] || continue
+            local all_present=1
 
-            while IFS= read -r counter; do
-                emergency_deadline_exceeded && return 2
-                [[ "${counter}" =~ ^[0-9]{6}$ ]] || continue
-                local all_present=1
-                for term in ${required_terms}; do
-                    local term_pad
-                    term_pad=$(printf "%02d" "${term}")
-                    local file_pattern="Run${rid_pad}_budget0_term${term_pad}_t${tidx}_n${counter}.s3D"
-                    if ! find "${budget_dir}" -maxdepth 1 -name "${file_pattern}" -print -quit \
-                        2>/dev/null | grep -q .; then
-                        all_present=0
-                        break
-                    fi
-                done
+            # In squeeze mode, only budget0 is written; terms 17-25 carry compact
+            # overloads needed for restart. Otherwise budget0 writes its full
+            # allocated field set.
+            local required_budget0_terms
+            if [[ "${squeeze}" == ".true." || "${squeeze}" == ".TRUE." ]]; then
+                required_budget0_terms="1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 31"
+            else
+                required_budget0_terms="$(seq 1 "${budget0_field_count}")"
+            fi
 
-                if [[ "${all_present}" -eq 1 ]]; then
-                    echo "${tidx_num},$((10#${counter}))"
+            for term in ${required_budget0_terms}; do
+                local term_pad
+                term_pad=$(printf "%02d" "${term}")
+                local file_pattern="Run${rid_pad}_budget0_term${term_pad}_t${tidx}_n${counter}.s3D"
+                if ! find "${budget_dir}" -maxdepth 1 -name "${file_pattern}" -print -quit \
+                    2>/dev/null | grep -q .; then
+                    all_present=0
+                    break
                 fi
-            done <<< "${counter_list}"
-        done <<< "${tidx_list}"
-    fi
+            done
+
+            if [[ "${all_present}" -eq 1 && ! ("${squeeze}" == ".true." || "${squeeze}" == ".TRUE.") ]]; then
+                local budget_num term term_pad file_pattern component
+
+                if [[ "${budget_type}" -gt 0 ]]; then
+                    for term in $(seq 1 16); do
+                        term_pad=$(printf "%02d" "${term}")
+                        file_pattern="Run${rid_pad}_budget1_term${term_pad}_t${tidx}_n${counter}.s3D"
+                        if ! find "${budget_dir}" -maxdepth 1 -name "${file_pattern}" -print -quit \
+                            2>/dev/null | grep -q .; then
+                            all_present=0
+                            break
+                        fi
+                    done
+                fi
+
+                if [[ "${all_present}" -eq 1 && "${budget_type}" -gt 1 ]]; then
+                    for term in $(seq 1 10); do
+                        term_pad=$(printf "%02d" "${term}")
+                        file_pattern="Run${rid_pad}_budget2_term${term_pad}_t${tidx}_n${counter}.s3D"
+                        if ! find "${budget_dir}" -maxdepth 1 -name "${file_pattern}" -print -quit \
+                            2>/dev/null | grep -q .; then
+                            all_present=0
+                            break
+                        fi
+                    done
+                fi
+
+                if [[ "${all_present}" -eq 1 && "${budget_type}" -gt 2 ]]; then
+                    for term in $(seq 1 8); do
+                        term_pad=$(printf "%02d" "${term}")
+                        file_pattern="Run${rid_pad}_budget3_term${term_pad}_t${tidx}_n${counter}.s3D"
+                        if ! find "${budget_dir}" -maxdepth 1 -name "${file_pattern}" -print -quit \
+                            2>/dev/null | grep -q .; then
+                            all_present=0
+                            break
+                        fi
+                    done
+                fi
+
+                if [[ "${all_present}" -eq 1 && "${budget_type}" -gt 3 ]]; then
+                    for component in 11 22 33 13 23; do
+                        for term in $(seq 1 10); do
+                            term_pad=$(printf "%02d" "${term}")
+                            file_pattern="Run${rid_pad}_budget4_${component}_term${term_pad}_t${tidx}_n${counter}.s3D"
+                            if ! find "${budget_dir}" -maxdepth 1 -name "${file_pattern}" -print -quit \
+                                2>/dev/null | grep -q .; then
+                                all_present=0
+                                break
+                            fi
+                        done
+                        [[ "${all_present}" -eq 1 ]] || break
+                    done
+                fi
+            fi
+
+            if [[ "${all_present}" -eq 1 ]]; then
+                echo "${tidx_num},$((10#${counter}))"
+            fi
+        done <<< "${counter_list}"
+    done <<< "${tidx_list}"
 }
 
 # Find common (tidx,counter) from multiple budget state lists
@@ -2538,9 +2602,19 @@ process_budget_restarts_for_file() {
             local squeeze=$(parse_budget_value "${section}" "squeeze")
             local budget_dir_raw=$(parse_budget_value "${section}" "budgets_dir")
             local budget_dir=$(resolve_budget_dir "${budget_dir_raw}")
+            local use_scalars=$(parse_namelist_value "${input_file}" "useScalars")
+            local num_scalars=$(parse_namelist_value "${input_file}" "num_scalars")
+            local budget0_field_count=31
+
+            [[ -z "${budget_type}" ]] && budget_type=0
+            [[ -z "${squeeze}" ]] && squeeze=".false."
+            if [[ "${use_scalars}" == ".true." || "${use_scalars}" == ".TRUE." ]]; then
+                [[ "${num_scalars}" =~ ^[0-9]+$ ]] || num_scalars=1
+                budget0_field_count=$((31 + 2 * num_scalars))
+            fi
             
             if [[ "${mode}" == "discover" ]]; then
-                mlog "[Budget][${file_label}] budgetType=${budget_type}, squeeze=${squeeze}"
+                mlog "[Budget][${file_label}] budgetType=${budget_type}, squeeze=${squeeze}, budget0_fields=${budget0_field_count}"
             fi
             
             if [[ ! -d "${budget_dir}" ]]; then
@@ -2552,8 +2626,8 @@ process_budget_restarts_for_file() {
                         update_failed=1
                     }
                 fi
-            elif [[ "${budget_type}" == "0" && ("${squeeze}" == ".true." || "${squeeze}" == ".TRUE.") ]]; then
-                local states=$(find_all_time_avg_budget_states "${budget_dir}" "${rid_pad}" "${budget_type}" "${max_tidx}")
+            else
+                local states=$(find_all_time_avg_budget_states "${budget_dir}" "${rid_pad}" "${budget_type}" "${max_tidx}" "${squeeze}" "${budget0_field_count}")
                 
                 if [[ -n "${states}" ]]; then
                     # Get latest state
@@ -2584,16 +2658,6 @@ process_budget_restarts_for_file() {
                             update_failed=1
                         }
                     fi
-                fi
-            else
-                if [[ "${mode}" == "discover" ]]; then
-                    mlog "[Budget][${file_label}] Skipping TIME_AVG restart (unsupported budgetType or squeeze setting)"
-                fi
-                if [[ "${mode}" == "update" ]]; then
-                    disable_budget_restart "${input_file}" "BUDGET_TIME_AVG" || {
-                        mlog "[Budget][${file_label}] ERROR: Failed to disable TIME_AVG budget restart"
-                        update_failed=1
-                    }
                 fi
             fi
         fi
