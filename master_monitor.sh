@@ -1289,6 +1289,16 @@ average_mem_rate_kbps() {
     fi
 }
 
+format_kb_to_gib() {
+    local kb="$1"
+    awk -v kb="${kb}" 'BEGIN { printf "%.1fGiB", kb / 1024 / 1024 }'
+}
+
+format_float_3() {
+    local value="$1"
+    awk -v value="${value}" 'BEGIN { printf "%.3f", value + 0 }'
+}
+
 parse_size_to_kb() {
     local s="$1"
     s="${s// /}"
@@ -3021,7 +3031,7 @@ while mpi_launcher_running; do
     sleep "${MONITOR_INTERVAL}"
 
     if ! mpi_launcher_running; then
-        mlog "[Monitor] MPI process finished normally."
+        mlog "[Run] MPI process finished normally."
         break
     fi
 
@@ -3038,6 +3048,9 @@ while mpi_launcher_running; do
 
     if sample_memory_sstat; then
         CURRENT_MAXRSS_KB="${SSTAT_MAXRSS_KB}"
+        MEM_RSS_FMT="$(format_kb_to_gib "${CURRENT_MAXRSS_KB}")"
+        MEM_CMP_FMT="$(format_kb_to_gib "${MEMORY_GUARD_COMPARE_LIMIT_KB}")"
+        MEM_TRIG_FMT="$(format_kb_to_gib "${MEMORY_GUARD_TRIGGER_KB}")"
 
         # Calculate utilization percentage
         MEM_UTIL_PCT=0
@@ -3052,13 +3065,13 @@ while mpi_launcher_running; do
             # Convert fraction to percentage for comparison
             if [[ "${MEM_UTIL_PCT}" -ge "${MEMORY_GUARD_HARD_STOP_PCT}" ]]; then
                 MEMORY_HARD_STOP_ACTIVE=1
-                mlog "[Monitor][Mem] rss=${CURRENT_MAXRSS_KB}KB (${MEM_UTIL_PCT}%) | scope=${MEMORY_GUARD_SCOPE_RESOLVED} | cmp=${MEMORY_GUARD_COMPARE_LIMIT_KB}KB | trig=${MEMORY_GUARD_TRIGGER_KB}KB | STATUS: CRITICAL_HARD_STOP"
+                mlog "[Mem] rss=${MEM_RSS_FMT} (${MEM_UTIL_PCT}%) | scope=${MEMORY_GUARD_SCOPE_RESOLVED} | cmp=${MEM_CMP_FMT} | trig=${MEM_TRIG_FMT} | STATUS: CRITICAL_HARD_STOP"
                 TRIGGER_REASON="MEMORY GUARD HARD STOP (MaxRSS at ${MEM_UTIL_PCT}% >= ${MEMORY_GUARD_HARD_STOP_PCT}% critical threshold)"
                 
             # Hard backstop: current RSS already at/above trigger
             elif [[ "${CURRENT_MAXRSS_KB}" -ge "${MEMORY_GUARD_TRIGGER_KB}" ]]; then
                 MEMORY_BAD_SAMPLES=$(( MEMORY_BAD_SAMPLES + 1 ))
-                mlog "[Monitor][Mem] rss=${CURRENT_MAXRSS_KB}KB (${MEM_UTIL_PCT}%) | scope=${MEMORY_GUARD_SCOPE_RESOLVED} | cmp=${MEMORY_GUARD_COMPARE_LIMIT_KB}KB | trig=${MEMORY_GUARD_TRIGGER_KB}KB | STATUS: AT_LIMIT bad=${MEMORY_BAD_SAMPLES}/${MEMORY_GUARD_PERSISTENCE_SAMPLES}"
+                mlog "[Mem] rss=${MEM_RSS_FMT} (${MEM_UTIL_PCT}%) | scope=${MEMORY_GUARD_SCOPE_RESOLVED} | cmp=${MEM_CMP_FMT} | trig=${MEM_TRIG_FMT} | STATUS: AT_LIMIT bad=${MEMORY_BAD_SAMPLES}/${MEMORY_GUARD_PERSISTENCE_SAMPLES}"
                 if [[ "${MEMORY_BAD_SAMPLES}" -ge "${MEMORY_GUARD_PERSISTENCE_SAMPLES}" ]]; then
                     TRIGGER_REASON="MEMORY GUARD (MaxRSS ${CURRENT_MAXRSS_KB} KB >= trigger ${MEMORY_GUARD_TRIGGER_KB} KB for ${MEMORY_BAD_SAMPLES} consecutive samples)"
                 fi
@@ -3069,9 +3082,10 @@ while mpi_launcher_running; do
                 MEM_RATE_KBPS="$(average_mem_rate_kbps || true)"
 
                 if [[ -n "${MEM_RATE_KBPS}" ]]; then
+                    MEM_RATE_FMT="${MEM_RATE_KBPS}KB/s"
                     if [[ "$(echo "${MEM_RATE_KBPS} <= 0" | bc 2>/dev/null)" -eq 1 ]]; then
                         [[ "${MEMORY_BAD_SAMPLES}" -gt 0 ]] && MEMORY_BAD_SAMPLES=0
-                        mlog "[Monitor][Mem] rss=${CURRENT_MAXRSS_KB}KB (${MEM_UTIL_PCT}%) | scope=${MEMORY_GUARD_SCOPE_RESOLVED} | cmp=${MEMORY_GUARD_COMPARE_LIMIT_KB}KB | trig=${MEMORY_GUARD_TRIGGER_KB}KB | rate=${MEM_RATE_KBPS}KB/s | STATUS: DECREASING"
+                        mlog "[Mem] rss=${MEM_RSS_FMT} (${MEM_UTIL_PCT}%) | scope=${MEMORY_GUARD_SCOPE_RESOLVED} | cmp=${MEM_CMP_FMT} | trig=${MEM_TRIG_FMT} | rate=${MEM_RATE_FMT} | STATUS: DECREASING"
                     else
                         MEM_HEADROOM_KB=$(( MEMORY_GUARD_TRIGGER_KB - CURRENT_MAXRSS_KB ))
                         MEM_TIME_TO_LIMIT=$(echo "scale=0; ${MEM_HEADROOM_KB} / ${MEM_RATE_KBPS}" | bc 2>/dev/null)
@@ -3084,23 +3098,23 @@ while mpi_launcher_running; do
 
                         if [[ "${MEM_UNSAFE}" -eq 1 ]]; then
                             MEMORY_BAD_SAMPLES=$(( MEMORY_BAD_SAMPLES + 1 ))
-                            mlog "[Monitor][Mem] rss=${CURRENT_MAXRSS_KB}KB (${MEM_UTIL_PCT}%) | scope=${MEMORY_GUARD_SCOPE_RESOLVED} | cmp=${MEMORY_GUARD_COMPARE_LIMIT_KB}KB | trig=${MEMORY_GUARD_TRIGGER_KB}KB | rate=${MEM_RATE_KBPS}KB/s | ttl=${MEM_TIME_TO_LIMIT}s < look=${MEM_LOOKAHEAD_SECONDS}s | STATUS: UNSAFE bad=${MEMORY_BAD_SAMPLES}/${MEMORY_GUARD_PERSISTENCE_SAMPLES}"
+                            mlog "[Mem] rss=${MEM_RSS_FMT} (${MEM_UTIL_PCT}%) | scope=${MEMORY_GUARD_SCOPE_RESOLVED} | cmp=${MEM_CMP_FMT} | trig=${MEM_TRIG_FMT} | rate=${MEM_RATE_FMT} | ttl=${MEM_TIME_TO_LIMIT}s < look=${MEM_LOOKAHEAD_SECONDS}s | STATUS: UNSAFE bad=${MEMORY_BAD_SAMPLES}/${MEMORY_GUARD_PERSISTENCE_SAMPLES}"
                             if [[ "${MEMORY_BAD_SAMPLES}" -ge "${MEMORY_GUARD_PERSISTENCE_SAMPLES}" ]]; then
                                 TRIGGER_REASON="MEMORY GUARD (MaxRSS projected to reach ${MEMORY_GUARD_TRIGGER_KB} KB in ${MEM_TIME_TO_LIMIT}s < ${MEM_LOOKAHEAD_SECONDS}s, persisted for ${MEMORY_BAD_SAMPLES} samples)"
                             fi
                         else
                             [[ "${MEMORY_BAD_SAMPLES}" -gt 0 ]] && MEMORY_BAD_SAMPLES=0
-                            mlog "[Monitor][Mem] rss=${CURRENT_MAXRSS_KB}KB (${MEM_UTIL_PCT}%) | scope=${MEMORY_GUARD_SCOPE_RESOLVED} | cmp=${MEMORY_GUARD_COMPARE_LIMIT_KB}KB | trig=${MEMORY_GUARD_TRIGGER_KB}KB | rate=${MEM_RATE_KBPS}KB/s | ttl=${MEM_TIME_TO_LIMIT}s > look=${MEM_LOOKAHEAD_SECONDS}s | STATUS: SAFE"
+                            mlog "[Mem] rss=${MEM_RSS_FMT} (${MEM_UTIL_PCT}%) | scope=${MEMORY_GUARD_SCOPE_RESOLVED} | cmp=${MEM_CMP_FMT} | trig=${MEM_TRIG_FMT} | rate=${MEM_RATE_FMT} | ttl=${MEM_TIME_TO_LIMIT}s > look=${MEM_LOOKAHEAD_SECONDS}s | STATUS: SAFE"
                         fi
                     fi
                 else
                     [[ "${MEMORY_BAD_SAMPLES}" -gt 0 ]] && MEMORY_BAD_SAMPLES=0
-                    mlog "[Monitor][Mem] rss=${CURRENT_MAXRSS_KB}KB (${MEM_UTIL_PCT}%) | scope=${MEMORY_GUARD_SCOPE_RESOLVED} | cmp=${MEMORY_GUARD_COMPARE_LIMIT_KB}KB | trig=${MEMORY_GUARD_TRIGGER_KB}KB | STATUS: WARMING (need 2+ samples)"
+                    mlog "[Mem] rss=${MEM_RSS_FMT} (${MEM_UTIL_PCT}%) | scope=${MEMORY_GUARD_SCOPE_RESOLVED} | cmp=${MEM_CMP_FMT} | trig=${MEM_TRIG_FMT} | STATUS: WARMING (need 2+ samples)"
                 fi
             fi
         else
             # Memory guard disabled - just log the sample
-            mlog "[Monitor][Mem] rss=${CURRENT_MAXRSS_KB}KB | STATUS: GUARD_DISABLED"
+            mlog "[Mem] rss=${MEM_RSS_FMT} | STATUS: GUARD_DISABLED"
         fi
 
     else
@@ -3108,7 +3122,7 @@ while mpi_launcher_running; do
         [[ "${MEMORY_BAD_SAMPLES}" -gt 0 ]] && MEMORY_BAD_SAMPLES=0
         MEM_EPOCH_HISTORY=()
         MEM_RSS_HISTORY=()
-        mlog "[Monitor][Mem] STATUS: NO_DATA (job step not registered yet)"
+        mlog "[Mem] STATUS: NO_DATA (job step not registered yet)"
     fi
 
     # ------------------------------------------------------------------
@@ -3118,7 +3132,7 @@ while mpi_launcher_running; do
     OUTPUT_LOG_AVAILABLE=1
     if [[ ! -f "${OUTPUT_LOG}" ]]; then
         OUTPUT_LOG_AVAILABLE=0
-        mlog "[Monitor] Output log not yet visible, waiting..."
+        mlog "[Output] Log not yet visible, waiting..."
         CURRENT_TIDX_RAW=""
     else
         CURRENT_LOG_MTIME=$(get_file_mtime_epoch "${OUTPUT_LOG}")
@@ -3146,6 +3160,8 @@ while mpi_launcher_running; do
     STEPS_TO_END=""
     CURRENT_SIM_TIME=""
     CURRENT_SIM_DT=""
+    CURRENT_SIM_TIME_FMT=""
+    CURRENT_SIM_DT_FMT=""
     SIM_END_RECORDS=0
     if [[ -n "${CURRENT_TIDX}" ]]; then
         SIM_END_ESTIMATE=$(get_latest_sim_end_estimate \
@@ -3157,6 +3173,8 @@ while mpi_launcher_running; do
                   "${SIM_END_RECORDS}" =~ ^[0-9]+$ && \
                   "${SIM_END_RECORDS}" -gt 0 ]]; then
                 SIM_END_ESTIMATE_VALID=1
+                CURRENT_SIM_TIME_FMT="$(format_float_3 "${CURRENT_SIM_TIME}")"
+                CURRENT_SIM_DT_FMT="$(format_float_3 "${CURRENT_SIM_DT}")"
             fi
         fi
     fi
@@ -3213,8 +3231,8 @@ while mpi_launcher_running; do
         END_REACHED=1
         END_REACHED_EPOCH="${NOW_EPOCH}"
         TRIGGER_REASON=""
-        mlog "[Monitor][Time] TIDX=${CURRENT_TIDX} | sim_time=${CURRENT_SIM_TIME} >= tstop=${SIMULATION_TSTOP} | STATUS: END_REACHED"
-        mlog "[Monitor] Simulation stop time reached; supervising normal MPI shutdown for up to ${END_SHUTDOWN_GRACE_SECONDS}s."
+        mlog "[Time] TIDX=${CURRENT_TIDX} | sim_time=${CURRENT_SIM_TIME_FMT} >= tstop=${SIMULATION_TSTOP} | STATUS: END_REACHED"
+        mlog "[Time] Simulation stop time reached; supervising normal MPI shutdown for up to ${END_SHUTDOWN_GRACE_SECONDS}s."
     fi
 
     if [[ "${END_REACHED}" -eq 1 ]]; then
@@ -3224,17 +3242,17 @@ while mpi_launcher_running; do
             "${MEMORY_HARD_STOP_ACTIVE}" "${END_WAITED}" \
             "${END_SHUTDOWN_GRACE_SECONDS}" "${TIME_LEFT}" "${HARD_CUTOFF_SECONDS}")"
         if [[ "${END_SHUTDOWN_ACTION}" == "terminate-memory" ]]; then
-            mlog "[Monitor][Time] Memory hard stop active after tstop; terminating without restart."
+            mlog "[Time] Memory hard stop active after tstop; terminating without restart."
             END_SHUTDOWN_FORCED=1
             terminate_mpi_launcher "memory hard stop after tstop"
             break
         elif [[ "${END_SHUTDOWN_ACTION}" == "terminate-time" ]]; then
-            mlog "[Monitor][Time] MPI still active ${END_WAITED}s after tstop; terminating without restart."
+            mlog "[Time] MPI still active ${END_WAITED}s after tstop; terminating without restart."
             END_SHUTDOWN_FORCED=1
             terminate_mpi_launcher "shutdown timeout after tstop"
             break
         fi
-        mlog "[Monitor][Time] Waiting for normal MPI exit after tstop (${END_WAITED}/${END_SHUTDOWN_GRACE_SECONDS}s)."
+        mlog "[Time] Waiting for normal MPI exit after tstop (${END_WAITED}/${END_SHUTDOWN_GRACE_SECONDS}s)."
 
     elif [[ -z "${TRIGGER_REASON}" && "${TIME_LEFT}" -le "${HARD_CUTOFF_SECONDS}" ]]; then
         TRIGGER_REASON="HARD CUTOFF (${TIME_LEFT}s left <= threshold ${HARD_CUTOFF_SECONDS}s)"
@@ -3262,22 +3280,23 @@ while mpi_launcher_running; do
             TARGET_KIND="end"
         fi
         if [[ "${SIM_END_ESTIMATE_VALID}" -eq 1 ]]; then
-            END_ESTIMATE_LOG="end_in=${STEPS_TO_END} sim_time=${CURRENT_SIM_TIME} dt=${CURRENT_SIM_DT} domains=${SIM_END_RECORDS}"
+            END_ESTIMATE_LOG="end_in=${STEPS_TO_END} sim_time=${CURRENT_SIM_TIME_FMT} dt=${CURRENT_SIM_DT_FMT}"
         fi
 
         if [[ -z "${STEPS_TO_TARGET}" ]]; then
-            mlog "[Monitor][Time] TIDX=${CURRENT_TIDX} | left=${TIME_LEFT}s | STATUS: NO_COMMON_DUMP (restart schedules do not intersect)"
+            mlog "[Time] TIDX=${CURRENT_TIDX} | left=${TIME_LEFT}s | STATUS: NO_COMMON_DUMP (restart schedules do not intersect)"
             ESTIMATE_BAD_SAMPLES=0
             ESTIMATE_LAST_BAD=0
         else
             TIME_NEEDED=$(echo "scale=2; ${SAFETY_FACTOR} * ${STEPS_TO_TARGET} * ${ELAPSED_PER_STEP}" | bc 2>/dev/null)
 
             if [[ -z "${TIME_NEEDED}" ]]; then
-                mlog "[Monitor][Time] WARNING: bc failed to compute TIME_NEEDED, skipping estimate."
+                mlog "[Time] WARNING: bc failed to compute TIME_NEEDED, skipping estimate."
             else
                 # Format time per step for cleaner display
                 TIME_PER_STEP_FMT=$(echo "scale=1; ${ELAPSED_PER_STEP}" | bc 2>/dev/null)
                 TIME_NEEDED_FMT=$(echo "scale=0; ${TIME_NEEDED}" | bc 2>/dev/null)
+                TARGET_LOG="target=${TARGET_KIND}(+${STEPS_TO_TARGET})"
 
                 NOT_ENOUGH=$(echo "${TIME_LEFT} < ${TIME_NEEDED}" | bc 2>/dev/null)
                 NOT_ENOUGH="${NOT_ENOUGH:-0}"
@@ -3285,15 +3304,15 @@ while mpi_launcher_running; do
                 if [[ "${NOT_ENOUGH}" -eq 1 ]]; then
                     ESTIMATE_BAD_SAMPLES=$(( ESTIMATE_BAD_SAMPLES + 1 ))
                     ESTIMATE_LAST_BAD=1
-                    mlog "[Monitor][Time] TIDX=${CURRENT_TIDX} | left=${TIME_LEFT}s < need=${TIME_NEEDED_FMT}s | target=${TARGET_KIND} target_in=${STEPS_TO_TARGET} common_dump_in=${STEPS_TO_DUMP:-none} ${END_ESTIMATE_LOG} @ ${TIME_PER_STEP_FMT}s/step | STATUS: UNSAFE bad=${ESTIMATE_BAD_SAMPLES}/${ESTIMATE_PERSISTENCE_SAMPLES} | idle=${IDLE_FOR}s"
+                    mlog "[Time] TIDX=${CURRENT_TIDX} | left=${TIME_LEFT}s < need=${TIME_NEEDED_FMT}s | ${TARGET_LOG} ${END_ESTIMATE_LOG} @ ${TIME_PER_STEP_FMT}s/step | STATUS: UNSAFE bad=${ESTIMATE_BAD_SAMPLES}/${ESTIMATE_PERSISTENCE_SAMPLES} | idle=${IDLE_FOR}s"
                     if [[ "${ESTIMATE_BAD_SAMPLES}" -ge "${ESTIMATE_PERSISTENCE_SAMPLES}" ]]; then
                         TRIGGER_REASON="ESTIMATE persisted for ${ESTIMATE_BAD_SAMPLES} consecutive samples (${TIME_LEFT}s left < ${TIME_NEEDED}s needed to reach ${TARGET_KIND})"
                     fi
                 else
                     if [[ "${ESTIMATE_LAST_BAD}" -eq 1 || "${ESTIMATE_BAD_SAMPLES}" -gt 0 ]]; then
-                        mlog "[Monitor][Time] TIDX=${CURRENT_TIDX} | left=${TIME_LEFT}s > need=${TIME_NEEDED_FMT}s | target=${TARGET_KIND} target_in=${STEPS_TO_TARGET} common_dump_in=${STEPS_TO_DUMP:-none} ${END_ESTIMATE_LOG} @ ${TIME_PER_STEP_FMT}s/step | STATUS: RECOVERED | idle=${IDLE_FOR}s"
+                        mlog "[Time] TIDX=${CURRENT_TIDX} | left=${TIME_LEFT}s > need=${TIME_NEEDED_FMT}s | ${TARGET_LOG} ${END_ESTIMATE_LOG} @ ${TIME_PER_STEP_FMT}s/step | STATUS: RECOVERED | idle=${IDLE_FOR}s"
                     else
-                        mlog "[Monitor][Time] TIDX=${CURRENT_TIDX} | left=${TIME_LEFT}s > need=${TIME_NEEDED_FMT}s | target=${TARGET_KIND} target_in=${STEPS_TO_TARGET} common_dump_in=${STEPS_TO_DUMP:-none} ${END_ESTIMATE_LOG} @ ${TIME_PER_STEP_FMT}s/step | STATUS: SAFE | idle=${IDLE_FOR}s"
+                        mlog "[Time] TIDX=${CURRENT_TIDX} | left=${TIME_LEFT}s > need=${TIME_NEEDED_FMT}s | ${TARGET_LOG} ${END_ESTIMATE_LOG} @ ${TIME_PER_STEP_FMT}s/step | STATUS: SAFE | idle=${IDLE_FOR}s"
                     fi
                     ESTIMATE_BAD_SAMPLES=0
                     ESTIMATE_LAST_BAD=0
@@ -3303,9 +3322,9 @@ while mpi_launcher_running; do
     else
         # No valid estimate yet
         if [[ -n "${CURRENT_TIDX}" ]]; then
-            mlog "[Monitor][Time] TIDX=${CURRENT_TIDX} | left=${TIME_LEFT}s | STATUS: WARMING (insufficient progress data) | idle=${IDLE_FOR}s"
+            mlog "[Time] TIDX=${CURRENT_TIDX} | left=${TIME_LEFT}s | STATUS: WARMING (insufficient progress data) | idle=${IDLE_FOR}s"
         else
-            mlog "[Monitor][Time] TIDX=unknown | left=${TIME_LEFT}s | STATUS: WARMING (insufficient progress data) | idle=${IDLE_FOR}s"
+            mlog "[Time] TIDX=unknown | left=${TIME_LEFT}s | STATUS: WARMING (insufficient progress data) | idle=${IDLE_FOR}s"
         fi
     fi
 
@@ -3320,27 +3339,27 @@ while mpi_launcher_running; do
 
     if [[ -n "${TRIGGER_REASON}" && "${CHILD_SUBMITTED}" -eq 0 ]]; then
         mlog "================================================================"
-        mlog "[Monitor] Restart trigger: ${TRIGGER_REASON}"
+        mlog "[Restart] Trigger: ${TRIGGER_REASON}"
         mlog "================================================================"
 
         trap '' TERM
         if ! acquire_restart_lock; then
             trap 'emergency_resubmit TERM' TERM
-            mlog "[Monitor] Restart lock already held. Another path is handling restart."
+            mlog "[Restart] Lock already held. Another path is handling restart."
             continue
         fi
         trap 'emergency_resubmit TERM' TERM
 
         if [[ "${TRIGGER_REASON}" == FROZEN* ]]; then
             if [[ "${STACK_DUMP_DONE}" -eq 0 ]]; then
-                mlog "[Monitor] Frozen trigger detected. Attempting MPI stack dump before restart sequence."
+                mlog "[Restart] Frozen trigger detected. Attempting MPI stack dump before restart sequence."
 
                 dump_mpi_stacks_for_frozen_job "${TRIGGER_REASON}" || \
-                    mlog "[Monitor] WARNING: MPI stack dump failed or was incomplete; continuing restart sequence."
+                    mlog "[Restart] WARNING: MPI stack dump failed or was incomplete; continuing restart sequence."
 
                 STACK_DUMP_DONE=1
             else
-                mlog "[Monitor] Frozen trigger detected, but stack dump was already attempted for this job. Skipping repeated dump."
+                mlog "[Restart] Frozen trigger detected, but stack dump was already attempted for this job. Skipping repeated dump."
             fi
         fi
 
@@ -3356,22 +3375,22 @@ while mpi_launcher_running; do
             "${PRECURSOR_INPUTDIR}" "${PRECURSOR_RID_PAD}")
 
         if [[ -z "${COMMON_TID_RAW}" ]]; then
-            mlog "[Monitor] ERROR: No common restart TID found."
+            mlog "[Restart] ERROR: No common restart TID found."
             mlog "  Primary   dir : ${PRIMARY_INPUTDIR}  (RID ${PRIMARY_RID_PAD})"
             mlog "  Precursor dir : ${PRECURSOR_INPUTDIR}  (RID ${PRECURSOR_RID_PAD})"
-            mlog "[Monitor] Will retry next cycle."
+            mlog "[Restart] Will retry next cycle."
             release_restart_lock
             continue
         fi
 
         COMMON_TID=$(( 10#${COMMON_TID_RAW} ))
-        mlog "[Monitor] Common restart TID: ${COMMON_TID}"
+        mlog "[Restart] Common restart TID: ${COMMON_TID}"
 
         if ! _update_input_files "${COMMON_TID}"; then
-            mlog "[Monitor] ERROR: Input file update failed. Restoring backups and retrying next cycle."
+            mlog "[Restart] ERROR: Input file update failed. Restoring backups and retrying next cycle."
             _restore_input_files
             if [[ "${EMERGENCY_SIGNAL_PENDING}" -eq 1 ]]; then
-                mlog "[Monitor] Emergency deadline interrupted restart preparation; terminating without unsafe submission."
+                mlog "[Restart] Emergency deadline interrupted restart preparation; terminating without unsafe submission."
                 terminate_mpi_launcher "emergency deadline during restart preparation"
                 release_restart_lock
                 exit 1
@@ -3390,19 +3409,19 @@ while mpi_launcher_running; do
             "${SUBMIT_ATTEMPTS}" "${SUBMIT_RETRY_SLEEP}" || true)"
 
         if [[ -z "${CHILD_JOB_ID}" || ! "${CHILD_JOB_ID}" =~ ^[0-9]+$ ]]; then
-            mlog "[Monitor] sbatch failed after retries (compute-node submission blocked?)."
-            mlog "[Monitor] Input files are already prepared. Falling back to staged handoff."
+            mlog "[Restart] sbatch failed after retries (compute-node submission blocked?)."
+            mlog "[Restart] Input files are already prepared. Falling back to staged handoff."
             stage_restart_handoff_and_exit "sbatch_unavailable_from_compute_node"
             # Does not return — stage_restart_handoff_and_exit kills MPI and exits
         fi
 
-        mlog "[Monitor] Child job queued: ID=${CHILD_JOB_ID} (depends on ${SLURM_JOB_ID})"
+        mlog "[Restart] Child job queued: ID=${CHILD_JOB_ID} (depends on ${SLURM_JOB_ID})"
         CHILD_SUBMITTED=1
 
-        mlog "[Monitor] Terminating MPI launcher (PID=${MPI_PID})..."
+        mlog "[Restart] Terminating MPI launcher (PID=${MPI_PID})..."
         trap - TERM
         terminate_mpi_launcher "restart child submitted"
-        mlog "[Monitor] MPI launcher terminated."
+        mlog "[Restart] MPI launcher terminated."
         break
     fi
 
