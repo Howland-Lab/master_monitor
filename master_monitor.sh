@@ -1109,61 +1109,23 @@ normalize_fortran_real() {
 
 next_common_dump_after() {
     local current_tidx="$1"
-    local primary_start="$2"
-    local primary_interval="$3"
-    local precursor_start="$4"
-    local precursor_interval="$5"
+    local primary_interval="$2"
+    local precursor_interval="$3"
 
+    # PadeOps triggers frame-based dumps at absolute multiples of each interval.
+    # Restart TIDs do not shift either schedule; common dumps repeat at the LCM.
     awk \
         -v current="${current_tidx}" \
-        -v a="${primary_start}" \
         -v m="${primary_interval}" \
-        -v b="${precursor_start}" \
         -v n="${precursor_interval}" '
-        function abs(x) { return x < 0 ? -x : x }
         function gcd(x, y, t) {
-            x = abs(x); y = abs(y)
             while (y != 0) { t = x % y; x = y; y = t }
             return x
         }
-        function mod(x, y) {
-            x %= y
-            return x < 0 ? x + y : x
-        }
-        function inverse(x, modulus, old_r, r, old_s, s, q, tmp) {
-            old_r = x; r = modulus
-            old_s = 1; s = 0
-            while (r != 0) {
-                q = int(old_r / r)
-                tmp = old_r - q * r; old_r = r; r = tmp
-                tmp = old_s - q * s; old_s = s; s = tmp
-            }
-            if (old_r != 1) return -1
-            return mod(old_s, modulus)
-        }
         BEGIN {
-            if (current < 0 || a < 0 || b < 0 || m <= 0 || n <= 0) exit 1
-
-            g = gcd(m, n)
-            diff = b - a
-            if (diff % g != 0) exit 2
-
-            reduced_n = n / g
-            if (reduced_n == 1) {
-                k = 0
-            } else {
-                inv = inverse(mod(m / g, reduced_n), reduced_n)
-                if (inv < 0) exit 2
-                k = mod((diff / g) * inv, reduced_n)
-            }
-
-            first = a + m * k
-            period = (m / g) * n
-            if (first <= current) {
-                jumps = int((current - first) / period) + 1
-                first += jumps * period
-            }
-            printf "%.0f\n", first
+            if (current < 0 || m <= 0 || n <= 0) exit 1
+            period = (m / gcd(m, n)) * n
+            printf "%.0f\n", (int(current / period) + 1) * period
         }
     '
 }
@@ -2082,8 +2044,8 @@ mlog "Primary input   : ${PRIMARY_INPUTFILE}"
 mlog "Precursor input : ${PRECURSOR_INPUTFILE}"
 mlog "Primary dir     : ${PRIMARY_INPUTDIR}"
 mlog "Precursor dir   : ${PRECURSOR_INPUTDIR}"
-mlog "Primary restart cadence   : start=${PRIMARY_RESTART_TID}, every=${PRIMARY_T_RESTART_DUMP} steps"
-mlog "Precursor restart cadence : start=${PRECURSOR_RESTART_TID}, every=${PRECURSOR_T_RESTART_DUMP} steps"
+mlog "Primary restart cadence   : absolute TIDX multiples of ${PRIMARY_T_RESTART_DUMP}"
+mlog "Precursor restart cadence : absolute TIDX multiples of ${PRECURSOR_T_RESTART_DUMP}"
 mlog "Primary tstop   : ${PRIMARY_TSTOP}"
 mlog "Precursor tstop : ${PRECURSOR_TSTOP}"
 mlog "Effective tstop : ${SIMULATION_TSTOP} (minimum)"
@@ -3263,8 +3225,8 @@ while mpi_launcher_running; do
     elif [[ -z "${TRIGGER_REASON}" && "${ELAPSED_PER_STEP_VALID}" -eq 1 && -n "${CURRENT_TIDX}" ]]; then
         NEXT_COMMON_DUMP=$(next_common_dump_after \
             "${CURRENT_TIDX}" \
-            "${PRIMARY_RESTART_TID}" "${PRIMARY_T_RESTART_DUMP}" \
-            "${PRECURSOR_RESTART_TID}" "${PRECURSOR_T_RESTART_DUMP}" || true)
+            "${PRIMARY_T_RESTART_DUMP}" \
+            "${PRECURSOR_T_RESTART_DUMP}" || true)
         STEPS_TO_DUMP=""
         STEPS_TO_TARGET=""
         TARGET_KIND=""
@@ -3284,7 +3246,7 @@ while mpi_launcher_running; do
         fi
 
         if [[ -z "${STEPS_TO_TARGET}" ]]; then
-            mlog "[Time] TIDX=${CURRENT_TIDX} | left=${TIME_LEFT}s | STATUS: NO_COMMON_DUMP (restart schedules do not intersect)"
+            mlog "[Time] TIDX=${CURRENT_TIDX} | left=${TIME_LEFT}s | STATUS: NO_COMMON_DUMP (next dump estimate unavailable)"
             ESTIMATE_BAD_SAMPLES=0
             ESTIMATE_LAST_BAD=0
         else

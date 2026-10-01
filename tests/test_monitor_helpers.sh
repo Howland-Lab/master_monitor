@@ -43,13 +43,30 @@ assert_eq "16050" "$(normalize_fortran_real 1.6050E+04)" "scientific E notation"
 assert_fails "invalid real" normalize_fortran_real invalid
 
 assert_eq "78000" \
-    "$(next_common_dump_after 76364 76000 1000 76000 2000)" \
+    "$(next_common_dump_after 76364 1000 2000)" \
     "aligned unequal intervals"
-assert_eq "2000" \
-    "$(next_common_dump_after 1500 0 1000 500 1500)" \
-    "offset schedules"
-assert_fails "non-intersecting schedules" \
-    next_common_dump_after 10 0 2 1 2
+assert_eq "3000" "$(next_common_dump_after 1500 1000 1500)" "LCM of unequal intervals"
+assert_eq "50000" "$(next_common_dump_after 49196 1000 1000)" "off-cadence restart"
+assert_eq "53000" "$(next_common_dump_after 52201 1000 1000)" "reported regression"
+assert_eq "799" "$(( $(next_common_dump_after 52201 1000 1000) - 52201 ))" "steps to absolute dump"
+assert_eq "54000" "$(next_common_dump_after 53000 1000 1000)" "strictly future dump"
+assert_eq "1000" "$(next_common_dump_after 0 1000 1000)" "fresh simulation"
+assert_fails "zero interval" next_common_dump_after 10 0 1000
+assert_fails "negative interval" next_common_dump_after 10 1000 -1
+
+# Exercise the actual monitor target-selection block without starting a job.
+check_time_target() {
+    local CURRENT_TIDX="$1" SIM_END_ESTIMATE_VALID="$2" STEPS_TO_END="$3"
+    local PRIMARY_T_RESTART_DUMP=1000 PRECURSOR_T_RESTART_DUMP=1000
+    local PRIMARY_RESTART_TID=49196 PRECURSOR_RESTART_TID=49196
+    local CURRENT_SIM_TIME_FMT=0 CURRENT_SIM_DT_FMT=1
+    local NEXT_COMMON_DUMP STEPS_TO_DUMP STEPS_TO_TARGET TARGET_KIND END_ESTIMATE_LOG
+    source <(sed -n '/^        NEXT_COMMON_DUMP=/,/^        if \[\[ -z "${STEPS_TO_TARGET}" \]\]; then/p' "${SCRIPT}" | sed '$d')
+    printf '%s:%s\n' "${TARGET_KIND}" "${STEPS_TO_TARGET}"
+}
+assert_eq "end:200" "$(check_time_target 53000 1 200)" "completion at 53200 precedes dump at 54000"
+assert_eq "common_dump:799" "$(check_time_target 52201 1 999)" "dump precedes completion at 53200"
+assert_eq "common_dump:1000" "$(check_time_target 53000 0 '')" "dump used when completion unknown"
 
 SLURM_JOB_ID=123
 scontrol() {

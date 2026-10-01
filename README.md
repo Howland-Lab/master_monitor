@@ -226,9 +226,12 @@ and the next restart dump. If the end-time records are unavailable, the
 existing restart-dump estimate remains in effect.
 
 Primary and precursor restart intervals may differ. The monitor reads each
-domain's `restartFile_TID` and `t_restartDump` and calculates the next future
-TIDX belonging to both dump schedules. If the schedules never intersect, only
-the simulation-end estimate and hard cutoff remain available.
+domain's `t_restartDump` and calculates the next strictly future multiple of
+the least common multiple of those intervals. These schedules use absolute
+TIDX values and are independent of `restartFile_TID`. For example, at TIDX
+52201 with both intervals set to 1000, the next common dump is 53000 (799
+steps away). After reaching 53000, if completion is estimated at 53200, the
+guard targets completion in 200 steps instead of the next dump at 54000.
 
 After the log reaches `tstop`, restart submission is disabled, but the launcher
 remains supervised for `END_SHUTDOWN_GRACE_SECONDS`. A launcher that does not
