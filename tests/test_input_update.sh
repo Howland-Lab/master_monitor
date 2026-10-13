@@ -12,6 +12,10 @@ source <(sed -n '/^commit_staged_input()/,/^}/p' "${SCRIPT}")
 source <(sed -n '/^_update_input_files()/,/^}/p' "${SCRIPT}")
 source <(sed -n '/^_restore_input_files()/,/^}/p' "${SCRIPT}")
 
+for helper in read_budget_setting normalize_budget_logical read_budget_logical validate_compact_precursor; do
+    source <(sed -n "/^${helper}()/,/^}/p" "${SCRIPT}")
+done
+
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "${tmpdir}"' EXIT
 
@@ -65,5 +69,76 @@ for file in "${PRIMARY_INPUTFILE}" "${PRECURSOR_INPUTFILE}"; do
         exit 1
     fi
 done
+
+# A discovery timeout must abort before either real input is committed.
+cp "${PRIMARY_INPUTFILE}" "${tmpdir}/primary.expected"
+cp "${PRECURSOR_INPUTFILE}" "${tmpdir}/precursor.expected"
+process_budget_restarts_for_file() { return 2; }
+rc=0
+_update_input_files 2000 || rc=$?
+if [[ "${rc}" -ne 2 ]] || ! cmp -s "${PRIMARY_INPUTFILE}" "${tmpdir}/primary.expected" || \
+   ! cmp -s "${PRECURSOR_INPUTFILE}" "${tmpdir}/precursor.expected"; then
+    printf 'FAIL: discovery timeout was swallowed or inputs changed\n' >&2
+    exit 1
+fi
+
+# Drive phase 3 through real preflight and staged namelist writes. A counter
+# mismatch must leave both originals untouched; matching counters may commit.
+for helper in set_namelist_value_in_section update_budget_namelist; do
+    source <(sed -n "/^${helper}()/,/^}/p" "${SCRIPT}")
+done
+cat >> "${PRIMARY_INPUTFILE}" <<'DATA'
+&BUDGET_TIME_AVG_DEFICIT_COMPACT
+ do_budgets=.true.
+ do_budget3=.true.
+ restart_budgets=.false.
+ restart_tid=0
+ restart_counter=0
+ restart_rid=0
+/
+DATA
+cat >> "${PRECURSOR_INPUTFILE}" <<'DATA'
+&BUDGET_TIME_AVG
+ tidx_compute=10000
+ do_budgets=.true.
+ budgetType=1
+ restart_budgets=.false.
+ restart_tid=0
+ restart_counter=0
+ restart_rid=0
+/
+DATA
+cp "${PRIMARY_INPUTFILE}" "${tmpdir}/primary.expected"
+cp "${PRECURSOR_INPUTFILE}" "${tmpdir}/precursor.expected"
+PRE_TEST_COUNTER=4
+process_budget_restarts_for_file() {
+    if [[ "$6" == discover ]]; then
+        echo 1500
+    elif [[ "$2" == PRIMARY ]]; then
+        update_budget_namelist "$1" BUDGET_TIME_AVG_DEFICIT_COMPACT 7 1000 3
+    else
+        update_budget_namelist "$1" BUDGET_TIME_AVG 6 1000 "${PRE_TEST_COUNTER}"
+    fi
+}
+if _update_input_files 2000; then
+    printf 'FAIL: mismatched compact/precursor counters committed\n' >&2
+    exit 1
+fi
+if ! cmp -s "${PRIMARY_INPUTFILE}" "${tmpdir}/primary.expected" || \
+   ! cmp -s "${PRECURSOR_INPUTFILE}" "${tmpdir}/precursor.expected"; then
+    printf 'FAIL: counter mismatch changed original inputs\n' >&2
+    exit 1
+fi
+BUDGET_RESTART_BLOCKED=0
+PRE_TEST_COUNTER=3
+if ! _update_input_files 2000; then
+    printf 'FAIL: matching compact/precursor counters rejected\n' >&2
+    exit 1
+fi
+if [[ "$(read_budget_setting "${PRIMARY_INPUTFILE}" BUDGET_TIME_AVG_DEFICIT_COMPACT restart_counter '')" != 3 || \
+      "$(read_budget_setting "${PRECURSOR_INPUTFILE}" BUDGET_TIME_AVG restart_counter '')" != 3 ]]; then
+    printf 'FAIL: matching counters were not committed\n' >&2
+    exit 1
+fi
 
 printf 'All input-update tests passed.\n'

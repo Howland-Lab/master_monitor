@@ -338,6 +338,43 @@ Before large runs, test the workflow on a short case and verify:
 
 ---
 
+## Budget restart validation
+
+Compact-deficit budgets are read from the primary input only. The monitor uses the
+local PadeOps defaults: `WINDTURBINES/useWindTurbines=.false.`,
+`PRESSURE_CALC/computeTurbinePressure=.false.`, `PHYSICS/useCoriolis=.true.`,
+`PHYSICS/isStratified=.false.`, and `BUDGET_TIME_AVG/budgetType=1`. Resolved compact
+flags are logged once per discovery, including whether each came from the input
+or the solver default. Scalar completeness uses `PHYSICS/useScalars` and
+`SCALARS/num_scalars` (defaults `.false.` and `0`).
+
+Before launching MPI, the monitor verifies that compact budgets have a compatible
+active precursor budget and equal, positive `tidx_compute` values. The solver's
+compute-cadence defaults differ (compact: `10000`; precursor: `1000000`), so coupled
+budgets normally need explicit matching cadences. Restart selection intersects
+complete compact and precursor records on **both time index and sample counter**.
+Extra files do not invalidate a complete required subset.
+
+Set `BUDGET_FAILURE_POLICY` in the local case script:
+
+- `abort` (default): if no shared compact/precursor record exists, leave the input
+  files unchanged and stop the chain without submitting a child. The monitor
+  remembers this failure for the current job; it does not repeat discovery.
+- `disable-budgets`: if no shared record exists, or a final history consistency
+  check fails, disable **budget restart** in both sections and continue the solver
+  restart. Budget computation remains enabled, but both averaging histories reset.
+
+Configuration errors still abort under either policy. Directory I/O errors are
+logged in the monitor log and retried on the next normal monitor cycle; they never
+trigger a budget reset. An emergency handoff may end before another retry is possible.
+
+An omitted or `NULL`/`null` `budgets_dir` uses `INPUT/outputdir`. An explicit
+`restart_dir` must resolve to the same directory as `budgets_dir`; otherwise the
+monitor refuses to commit a restart that would read from a different location.
+These paths use the monitor's working directory for relative-path resolution.
+
+---
+
 ## Limitations
 
 This repository is designed for restartable simulations and is not a general scheduler framework. In particular:

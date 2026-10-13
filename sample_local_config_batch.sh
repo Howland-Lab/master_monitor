@@ -14,6 +14,10 @@
 # Path to the main input file that points to the coupled / case-specific inputs
 MAIN_INPUTFILE="/path/to/case_directory/input_main.dat"
 
+# Missing shared compact/precursor history: stop the chain (default), or set
+# "disable-budgets" to restart the solver with both averaging histories reset.
+BUDGET_FAILURE_POLICY="abort"
+
 # Path to the solver executable
 SOLVER="/path/to/solver_binary"
 
